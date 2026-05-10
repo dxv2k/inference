@@ -63,23 +63,33 @@ local-workflow-demo/
 
 ## Quickstart
 
+Run everything from this directory (`examples/local-workflow-demo/`):
+
 ```bash
-# 1. Install (uv handles torch+cuda121 + ultralytics + gradio + the inference repo).
+cd examples/local-workflow-demo
+
+# 1. Install (uv handles torch+cuda121 + ultralytics + gradio).
 uv sync
 
-# 2. Make sure the inference repo itself is installed in editable mode.
-#    (Required for `from inference.core.workflows.execution_engine.core import ExecutionEngine`.)
-uv pip install -e ../..
+# 2. Install the inference repo in editable mode + its base requirements.
+uv pip install -e ../.. --no-deps
+uv pip install \
+  -r ../../requirements/_requirements.txt \
+  -r ../../requirements/requirements.cpu.txt \
+  --constraint <(echo "torch==2.5.1"; echo "torchvision<0.21"; echo "numpy>=2.0,<2.4")
 
-# 3. Run.
+# 3. (Optional) install Triton client for the swappable backend in Tabs 4-6.
+uv pip install 'tritonclient[grpc]'
+
+# 4. Run.
 uv run python app.py
 # → http://0.0.0.0:7872
 ```
 
-Tabs 1–3 work immediately. Tabs 4–6 require the inference package to be
-importable — the `WORKFLOWS_PLUGINS=local_yolo_plugin` env var is set
-internally by `real_engine_runner.py` / `rtsp_runner.py`, so you don't need
-to export it yourself.
+Tabs 1-3 work immediately. Tabs 4-6 require the inference package to be
+importable. Plugins are auto-registered via `WORKFLOWS_PLUGINS` set by
+`real_engine_runner.py` (it picks up the Triton plugin only when
+`tritonclient` is importable).
 
 ## Tab 6: RTSP without a real camera
 
