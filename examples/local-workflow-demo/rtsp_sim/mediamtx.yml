@@ -1,0 +1,24 @@
+# Minimal MediaMTX config — local RTSP server only.
+# Listens on 0.0.0.0:8554. Anonymous publish + read.
+
+logLevel: info
+logDestinations: [stdout]
+
+rtsp: yes
+rtspAddress: :8554
+protocols: [tcp, udp]
+encryption: "no"
+
+hls: no
+webrtc: no
+srt: no
+rtmp: no
+api: no
+metrics: no
+playback: no
+
+pathDefaults:
+  source: publisher
+
+paths:
+  all_others:

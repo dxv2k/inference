@@ -1,0 +1,13 @@
+# Auto-downloaded RTSP server binary + runtime logs
+rtsp_sim/mediamtx
+rtsp_sim/mediamtx.tar.gz
+rtsp_sim/*.log
+
+# Ultralytics weights — fetched on first run by `YOLO("yolov8n.pt")`
+yolov8n.pt
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
