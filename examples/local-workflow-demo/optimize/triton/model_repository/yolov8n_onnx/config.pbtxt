@@ -1,0 +1,39 @@
+# Triton model config for YOLOv8n exported via Ultralytics → ONNX (imgsz=640).
+# Drop the exported file at: yolov8n_onnx/1/model.onnx
+#
+# Tensor names ("images", "output0") match Ultralytics' default ONNX export.
+# Verify with `onnxinfo yolov8n_onnx/1/model.onnx` or `polygraphy inspect model`.
+
+name: "yolov8n_onnx"
+platform: "onnxruntime_onnx"
+max_batch_size: 8
+
+input [
+  {
+    name: "images"
+    data_type: TYPE_FP32
+    dims: [3, 640, 640]
+  }
+]
+
+output [
+  {
+    name: "output0"
+    data_type: TYPE_FP32
+    dims: [84, 8400]
+  }
+]
+
+# Aggregate inflight requests from N camera workers into batched GPU calls.
+# Tune preferred_batch_size to your steady-state camera count.
+dynamic_batching {
+  preferred_batch_size: [4, 8]
+  max_queue_delay_microseconds: 5000
+}
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]

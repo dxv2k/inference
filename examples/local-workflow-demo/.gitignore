@@ -7,6 +7,13 @@ rtsp_sim/*.log
 yolov8n.pt
 *.pt
 
+# Exported model artifacts (ONNX/TensorRT) — produced by optimize/triton/export_to_onnx.sh
+*.onnx
+*.engine
+*.plan
+optimize/triton/model_repository/*/1/*.onnx
+optimize/triton/model_repository/*/1/*.plan
+
 # Python
 __pycache__/
 *.pyc

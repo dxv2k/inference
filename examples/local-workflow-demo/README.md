@@ -149,6 +149,15 @@ the same primitive the inference HTTP server uses. Buffer is set to
 The only network traffic on first install is `pip install` from PyPI.
 After that, this demo runs fully air-gapped.
 
+## Speeding it up — ONNX, TensorRT, Triton
+
+The custom `LocalYoloBlockV1` is the only place the demo touches a model.
+Swapping to ONNX, TensorRT, or Triton is a matter of changing what that one
+block does — every workflow JSON, every Gradio tab stays unchanged.
+
+- See `BACKENDS.md` for the comparison and decision tree.
+- See `optimize/triton/README.md` for a runnable Triton starting point.
+
 ## See also
 
 - `../stream-examples/` — older stream-processing examples
