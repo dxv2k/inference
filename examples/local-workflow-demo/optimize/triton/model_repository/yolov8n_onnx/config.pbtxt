@@ -26,6 +26,10 @@ output [
 
 # Aggregate inflight requests from N camera workers into batched GPU calls.
 # Tune preferred_batch_size to your steady-state camera count.
+# max_queue_delay_microseconds = 50ms: the window Triton waits for more
+# requests before dispatching. Too small (e.g. 5ms) and sparse traffic never
+# batches; too large and per-frame latency suffers. 50ms is a reasonable
+# compromise for ~30-camera deployments at ~5fps each.
 dynamic_batching {
   preferred_batch_size: [4, 8]
   max_queue_delay_microseconds: 5000
