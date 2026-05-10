@@ -159,6 +159,24 @@ the same primitive the inference HTTP server uses. Buffer is set to
 The only network traffic on first install is `pip install` from PyPI.
 After that, this demo runs fully air-gapped.
 
+## Building your own custom block
+
+The pattern this demo uses to plug a local YOLO into a Roboflow workflow
+(without forking the inference repo) is captured as a Claude Code skill in
+[`.claude/skills/roboflow-workflow-custom-block/`](.claude/skills/roboflow-workflow-custom-block/).
+If you're using Claude Code in this repo, the skill activates automatically
+when you ask about custom WorkflowBlocks. Otherwise, read it directly:
+
+- [`SKILL.md`](.claude/skills/roboflow-workflow-custom-block/SKILL.md) — workflow,
+  when-to-use, the four hard footguns we hit
+- [`references/block-contract.md`](.claude/skills/roboflow-workflow-custom-block/references/block-contract.md)
+  — manifest schema, single vs. batched run, `sv.Detections` metadata table
+- [`references/driver-pattern.md`](.claude/skills/roboflow-workflow-custom-block/references/driver-pattern.md)
+  — `ExecutionEngine.init` signature, the persistent-`ThreadPoolExecutor` fix,
+  frame wrapping, plugin packaging
+- [`assets/example_plugin.py`](.claude/skills/roboflow-workflow-custom-block/assets/example_plugin.py)
+  — minimal copy-and-edit template (~190 LOC)
+
 ## Speeding it up — ONNX, TensorRT, Triton
 
 The custom `LocalYoloBlockV1` is the only place the demo touches a model.
