@@ -35,6 +35,7 @@ from inference.core.workflows.core_steps.common.utils import (
     attach_parents_coordinates_to_sv_detections,
 )
 from inference.core.workflows.execution_engine.entities.base import (
+    Batch,
     OutputDefinition,
     WorkflowImageData,
 )
@@ -160,7 +161,7 @@ class TritonYoloManifest(WorkflowBlockManifest):
         protected_namespaces=(),
     )
     type: Literal["triton/yolo@v1"]
-    image: WorkflowImageSelector = Field(description="Input image.")
+    images: WorkflowImageSelector = Field(description="Input image(s). Batch-aware.")
     triton_url: Union[str, Selector()] = Field(
         default="localhost:8001",
         description="Triton gRPC endpoint (host:port).",
@@ -183,11 +184,12 @@ class TritonYoloManifest(WorkflowBlockManifest):
     )
     confidence: Union[float, Selector(kind=[FLOAT_ZERO_TO_ONE_KIND])] = Field(
         default=0.30,
-        description="Score threshold applied during NMS post-processing.",
+        description="Score threshold applied AFTER server-side NMS — only filters out "
+                    "padding/low-conf rows. Real NMS happens inside the model graph.",
     )
     iou: Union[float, Selector(kind=[FLOAT_ZERO_TO_ONE_KIND])] = Field(
         default=0.45,
-        description="IoU threshold used by NMS.",
+        description="Unused: NMS is server-side now. Kept for backwards-compatible workflows.",
     )
     keep_classes: Optional[Union[List[str], Selector(kind=[LIST_OF_VALUES_KIND])]] = Field(
         default=None,
@@ -197,6 +199,10 @@ class TritonYoloManifest(WorkflowBlockManifest):
         default=None,
         description="Custom class names (defaults to COCO 80 classes if omitted).",
     )
+
+    @classmethod
+    def get_parameters_accepting_batches(cls) -> List[str]:
+        return ["images"]
 
     @classmethod
     def describe_outputs(cls) -> List[OutputDefinition]:
@@ -221,7 +227,7 @@ class TritonYoloBlockV1(WorkflowBlock):
 
     def run(
         self,
-        image: WorkflowImageData,
+        images: Batch[WorkflowImageData],
         triton_url: str,
         model_name: str,
         input_name: str,
@@ -232,74 +238,90 @@ class TritonYoloBlockV1(WorkflowBlock):
         keep_classes: Optional[List[str]] = None,
         class_names: Optional[List[str]] = None,
     ) -> BlockResult:
-        np_img = image.numpy_image
-        h, w = np_img.shape[:2]
+        # 1. Preprocess each frame: letterbox → normalize → NCHW float32
+        preprocessed: list[np.ndarray] = []
+        scales: list[tuple[float, int, int, int, int]] = []  # (scale, pad_w, pad_h, h, w)
+        for img in images:
+            np_img = img.numpy_image
+            h, w = np_img.shape[:2]
+            lb, scale, (pad_w, pad_h) = _letterbox(np_img, (int(imgsz), int(imgsz)))
+            x = lb.astype(np.float32) / 255.0
+            x = x.transpose(2, 0, 1)        # HWC → CHW
+            preprocessed.append(x)
+            scales.append((scale, pad_w, pad_h, h, w))
 
-        # 1. Preprocess: letterbox → normalize → NCHW float32
-        lb, scale, (pad_w, pad_h) = _letterbox(np_img, (int(imgsz), int(imgsz)))
-        x = lb.astype(np.float32) / 255.0
-        x = x.transpose(2, 0, 1)[None]   # HWC → 1×C×H×W
-        x = np.ascontiguousarray(x)
-
-        # 2. gRPC infer
+        # 2. Stack into one (N, 3, H, W) batch tensor and send ONE gRPC call.
+        batch = np.ascontiguousarray(np.stack(preprocessed, axis=0))
         client = _get_client(triton_url)
-        inp = grpcclient.InferInput(input_name, x.shape, "FP32")
-        inp.set_data_from_numpy(x)
+        inp = grpcclient.InferInput(input_name, batch.shape, "FP32")
+        inp.set_data_from_numpy(batch)
         out = grpcclient.InferRequestedOutput(output_name)
         result = client.infer(model_name=model_name, inputs=[inp], outputs=[out])
-        raw = result.as_numpy(output_name)   # shape (1, 84, 8400) for COCO YOLOv8
-        if raw is None:
+        raw_batch = result.as_numpy(output_name)
+        # With server-side NMS (nms=True export), shape is (N, 300, 6) where
+        # each row is [x1,y1,x2,y2,conf,cls] in letterbox pixel coords;
+        # padding rows have conf=0.
+        if raw_batch is None:
             raise RuntimeError(f"Triton returned no output named {output_name!r}")
 
-        # 3. Post-process: NMS in letterbox coords → un-letterbox to original image
-        dets = _nms_yolov8(raw[0], conf_thres=float(confidence), iou_thres=float(iou))
-        if len(dets):
-            dets[:, [0, 2]] -= pad_w
-            dets[:, [1, 3]] -= pad_h
-            dets[:, :4] /= scale
-            dets[:, [0, 2]] = dets[:, [0, 2]].clip(0, w - 1)
-            dets[:, [1, 3]] = dets[:, [1, 3]].clip(0, h - 1)
-
         names = list(class_names) if class_names else list(COCO_CLASSES)
+        keep_set = {str(c) for c in keep_classes} if keep_classes else None
+        conf_thres = float(confidence)
 
-        # 4. Optional class filter
-        if keep_classes:
-            keep = {str(c) for c in keep_classes}
-            cls_idx = dets[:, 5].astype(int) if len(dets) else np.empty((0,), dtype=int)
-            mask = np.array([(names[c] in keep) if c < len(names) else False for c in cls_idx], dtype=bool)
-            dets = dets[mask] if len(dets) else dets
+        # 3. Per-image post-process (un-letterbox, build sv.Detections).
+        # No Python NMS needed — the graph already did it.
+        outputs: List[dict] = []
+        for img, raw, (scale, pad_w, pad_h, h, w) in zip(images, raw_batch, scales):
+            # raw shape (300, 6) — keep rows with conf > thresh
+            mask = raw[:, 4] > conf_thres
+            dets = raw[mask].astype(np.float32, copy=True)
+            if len(dets):
+                dets[:, [0, 2]] -= pad_w
+                dets[:, [1, 3]] -= pad_h
+                dets[:, :4] /= scale
+                dets[:, [0, 2]] = dets[:, [0, 2]].clip(0, w - 1)
+                dets[:, [1, 3]] = dets[:, [1, 3]].clip(0, h - 1)
 
-        # 5. Build sv.Detections with the metadata Roboflow blocks expect
-        n = len(dets)
-        if n:
-            xyxy = dets[:, :4].astype(np.float32)
-            conf_arr = dets[:, 4].astype(np.float32)
-            cls_arr = dets[:, 5].astype(int)
-            class_name_arr = np.array(
-                [names[c] if c < len(names) else f"cls_{c}" for c in cls_arr],
-                dtype=object,
+            if keep_set:
+                cls_idx = dets[:, 5].astype(int) if len(dets) else np.empty((0,), dtype=int)
+                mask = np.array(
+                    [(names[c] in keep_set) if c < len(names) else False for c in cls_idx],
+                    dtype=bool,
+                )
+                dets = dets[mask] if len(dets) else dets
+
+            n = len(dets)
+            if n:
+                xyxy = dets[:, :4].astype(np.float32)
+                conf_arr = dets[:, 4].astype(np.float32)
+                cls_arr = dets[:, 5].astype(int)
+                class_name_arr = np.array(
+                    [names[c] if c < len(names) else f"cls_{c}" for c in cls_arr],
+                    dtype=object,
+                )
+            else:
+                xyxy = np.empty((0, 4), dtype=np.float32)
+                conf_arr = np.empty((0,), dtype=np.float32)
+                cls_arr = np.empty((0,), dtype=int)
+                class_name_arr = np.array([], dtype=object)
+
+            detections = sv.Detections(xyxy=xyxy, confidence=conf_arr, class_id=cls_arr)
+            detections.data[CLASS_NAME_DATA_KEY] = class_name_arr
+            detections.data[DETECTION_ID_KEY] = np.array(
+                [str(uuid.uuid4()) for _ in range(n)], dtype=object,
             )
-        else:
-            xyxy = np.empty((0, 4), dtype=np.float32)
-            conf_arr = np.empty((0,), dtype=np.float32)
-            cls_arr = np.empty((0,), dtype=int)
-            class_name_arr = np.array([], dtype=object)
-
-        detections = sv.Detections(xyxy=xyxy, confidence=conf_arr, class_id=cls_arr)
-        detections.data[CLASS_NAME_DATA_KEY] = class_name_arr
-        detections.data[DETECTION_ID_KEY] = np.array(
-            [str(uuid.uuid4()) for _ in range(n)], dtype=object,
-        )
-        detections.data[IMAGE_DIMENSIONS_KEY] = (
-            np.tile(np.array([h, w], dtype=int), (n, 1)) if n else np.empty((0, 2), dtype=int)
-        )
-        detections.data[PREDICTION_TYPE_KEY] = np.array(
-            ["object-detection"] * n, dtype=object,
-        )
-        detections = attach_parents_coordinates_to_sv_detections(
-            detections=detections, image=image,
-        )
-        return {"predictions": detections}
+            detections.data[IMAGE_DIMENSIONS_KEY] = (
+                np.tile(np.array([h, w], dtype=int), (n, 1))
+                if n else np.empty((0, 2), dtype=int)
+            )
+            detections.data[PREDICTION_TYPE_KEY] = np.array(
+                ["object-detection"] * n, dtype=object,
+            )
+            detections = attach_parents_coordinates_to_sv_detections(
+                detections=detections, image=img,
+            )
+            outputs.append({"predictions": detections})
+        return outputs
 
 
 def load_blocks() -> List[Type[WorkflowBlock]]:

@@ -6,7 +6,7 @@
 
 name: "yolov8n_onnx"
 platform: "onnxruntime_onnx"
-max_batch_size: 8
+max_batch_size: 32
 
 input [
   {
@@ -20,7 +20,8 @@ output [
   {
     name: "output0"
     data_type: TYPE_FP32
-    dims: [84, -1]   # anchors dim is dynamic when exported with dynamic=True
+    dims: [300, 6]   # NMS folded into the graph: each row is [x1,y1,x2,y2,conf,cls];
+                     # exported with `nms=True`, exactly 300 rows per image (zero-padded).
   }
 ]
 
@@ -31,7 +32,7 @@ output [
 # batches; too large and per-frame latency suffers. 50ms is a reasonable
 # compromise for ~30-camera deployments at ~5fps each.
 dynamic_batching {
-  preferred_batch_size: [4, 8]
+  preferred_batch_size: [8, 16]
   max_queue_delay_microseconds: 5000
 }
 

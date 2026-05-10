@@ -24,6 +24,7 @@ from inference.core.workflows.core_steps.common.utils import (
     attach_parents_coordinates_to_sv_detections,
 )
 from inference.core.workflows.execution_engine.entities.base import (
+    Batch,
     OutputDefinition,
     WorkflowImageData,
 )
@@ -77,7 +78,7 @@ class LocalYoloManifest(WorkflowBlockManifest):
         protected_namespaces=(),
     )
     type: Literal["local_models/ultralytics_yolo@v1"]
-    image: WorkflowImageSelector = Field(description="Input image (with video metadata).")
+    images: WorkflowImageSelector = Field(description="Input image(s). Batch-aware.")
     weights: Union[str, Selector()] = Field(
         default="yolov8n.pt",
         description="Path or name of Ultralytics YOLO weights.",
@@ -94,6 +95,10 @@ class LocalYoloManifest(WorkflowBlockManifest):
         default=None,
         description="If set, only detections whose class_name is in this list are emitted.",
     )
+
+    @classmethod
+    def get_parameters_accepting_batches(cls) -> List[str]:
+        return ["images"]
 
     @classmethod
     def describe_outputs(cls) -> List[OutputDefinition]:
@@ -118,59 +123,64 @@ class LocalYoloBlockV1(WorkflowBlock):
 
     def run(
         self,
-        image: WorkflowImageData,
+        images: Batch[WorkflowImageData],
         weights: str,
         device: str,
         confidence: float,
         keep_classes: Optional[List[str]] = None,
     ) -> BlockResult:
         model = _get_model(weights, device)
-        np_img = image.numpy_image
-        h, w = np_img.shape[:2]
-
-        results = model.predict(np_img, conf=float(confidence), device=device, verbose=False)[0]
-        boxes = results.boxes
-
-        if boxes is None or len(boxes) == 0:
-            xyxy = np.empty((0, 4), dtype=np.float32)
-            cls_idx = np.empty((0,), dtype=int)
-            conf = np.empty((0,), dtype=np.float32)
-        else:
-            xyxy = boxes.xyxy.cpu().numpy().astype(np.float32)
-            cls_idx = boxes.cls.cpu().numpy().astype(int)
-            conf = boxes.conf.cpu().numpy().astype(np.float32)
+        # One Ultralytics call with a list of frames -> Ultralytics handles
+        # the batch dim internally (one forward pass on the GPU).
+        frame_list = [img.numpy_image for img in images]
+        results_list = model.predict(
+            frame_list, conf=float(confidence), device=device, verbose=False
+        )
         names_map = model.names
+        keep_set = {str(c) for c in keep_classes} if keep_classes else None
 
-        if keep_classes:
-            keep = {str(c) for c in keep_classes}
-            class_names = [names_map[int(c)] for c in cls_idx]
-            mask = np.array([n in keep for n in class_names], dtype=bool) if len(class_names) else np.array([], dtype=bool)
-            xyxy = xyxy[mask]
-            cls_idx = cls_idx[mask]
-            conf = conf[mask]
-        n = len(xyxy)
+        outputs: List[dict] = []
+        for img, results in zip(images, results_list):
+            np_img = img.numpy_image
+            h, w = np_img.shape[:2]
+            boxes = results.boxes
+            if boxes is None or len(boxes) == 0:
+                xyxy = np.empty((0, 4), dtype=np.float32)
+                cls_idx = np.empty((0,), dtype=int)
+                conf = np.empty((0,), dtype=np.float32)
+            else:
+                xyxy = boxes.xyxy.cpu().numpy().astype(np.float32)
+                cls_idx = boxes.cls.cpu().numpy().astype(int)
+                conf = boxes.conf.cpu().numpy().astype(np.float32)
 
-        detections = sv.Detections(
-            xyxy=xyxy,
-            confidence=conf,
-            class_id=cls_idx,
-        )
-        detections.data[CLASS_NAME_DATA_KEY] = np.array(
-            [names_map[int(c)] for c in cls_idx], dtype=object
-        )
-        detections.data[DETECTION_ID_KEY] = np.array(
-            [str(uuid.uuid4()) for _ in range(n)], dtype=object
-        )
-        detections.data[IMAGE_DIMENSIONS_KEY] = (
-            np.tile(np.array([h, w], dtype=int), (n, 1)) if n else np.empty((0, 2), dtype=int)
-        )
-        detections.data[PREDICTION_TYPE_KEY] = np.array(
-            ["object-detection"] * n, dtype=object
-        )
-        detections = attach_parents_coordinates_to_sv_detections(
-            detections=detections, image=image,
-        )
-        return {"predictions": detections}
+            if keep_set:
+                class_names = [names_map[int(c)] for c in cls_idx]
+                mask = (np.array([n in keep_set for n in class_names], dtype=bool)
+                        if len(class_names) else np.array([], dtype=bool))
+                xyxy = xyxy[mask]
+                cls_idx = cls_idx[mask]
+                conf = conf[mask]
+            n = len(xyxy)
+
+            detections = sv.Detections(xyxy=xyxy, confidence=conf, class_id=cls_idx)
+            detections.data[CLASS_NAME_DATA_KEY] = np.array(
+                [names_map[int(c)] for c in cls_idx], dtype=object
+            )
+            detections.data[DETECTION_ID_KEY] = np.array(
+                [str(uuid.uuid4()) for _ in range(n)], dtype=object
+            )
+            detections.data[IMAGE_DIMENSIONS_KEY] = (
+                np.tile(np.array([h, w], dtype=int), (n, 1))
+                if n else np.empty((0, 2), dtype=int)
+            )
+            detections.data[PREDICTION_TYPE_KEY] = np.array(
+                ["object-detection"] * n, dtype=object
+            )
+            detections = attach_parents_coordinates_to_sv_detections(
+                detections=detections, image=img,
+            )
+            outputs.append({"predictions": detections})
+        return outputs
 
 
 def load_blocks() -> List[Type[WorkflowBlock]]:

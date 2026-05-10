@@ -64,7 +64,7 @@ def _detect_step(backend: str, *, with_keep_classes: bool = False) -> dict:
         step = {
             "type": "triton/yolo@v1",
             "name": "detect",
-            "image": "$inputs.image",
+            "images": "$inputs.image",
             "triton_url": "$inputs.triton_url",
             "model_name": "$inputs.triton_model",
             "confidence": "$inputs.conf",
@@ -73,7 +73,7 @@ def _detect_step(backend: str, *, with_keep_classes: bool = False) -> dict:
         step = {
             "type": "local_models/ultralytics_yolo@v1",
             "name": "detect",
-            "image": "$inputs.image",
+            "images": "$inputs.image",
             "weights": "$inputs.weights",
             "device": "$inputs.device",
             "confidence": "$inputs.conf",

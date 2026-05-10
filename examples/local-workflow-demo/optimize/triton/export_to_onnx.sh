@@ -9,8 +9,11 @@ WEIGHTS="${1:-yolov8n.pt}"
 IMGSZ="${2:-640}"
 
 cd "$DEMO_DIR"
-echo "Exporting $WEIGHTS at imgsz=$IMGSZ → ONNX (dynamic batch) ..."
-uv run yolo export model="$WEIGHTS" format=onnx imgsz="$IMGSZ" simplify=True dynamic=True
+echo "Exporting $WEIGHTS at imgsz=$IMGSZ → ONNX (dynamic batch + server-side NMS) ..."
+# nms=True folds NMS into the graph. Output becomes (N, 300, 6) where each
+# row is [x1,y1,x2,y2,conf,cls]. Eliminates Python-side NMS (the bottleneck
+# at high batch sizes). Trade-off: top-K is fixed at export time (300).
+uv run yolo export model="$WEIGHTS" format=onnx imgsz="$IMGSZ" simplify=True dynamic=True nms=True
 
 base="${WEIGHTS%.pt}"
 mkdir -p "$HERE/model_repository/yolov8n_onnx/1"
