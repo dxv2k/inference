@@ -9,8 +9,8 @@ WEIGHTS="${1:-yolov8n.pt}"
 IMGSZ="${2:-640}"
 
 cd "$DEMO_DIR"
-echo "Exporting $WEIGHTS at imgsz=$IMGSZ → ONNX ..."
-uv run yolo export model="$WEIGHTS" format=onnx imgsz="$IMGSZ" simplify=True dynamic=False
+echo "Exporting $WEIGHTS at imgsz=$IMGSZ → ONNX (dynamic batch) ..."
+uv run yolo export model="$WEIGHTS" format=onnx imgsz="$IMGSZ" simplify=True dynamic=True
 
 base="${WEIGHTS%.pt}"
 mkdir -p "$HERE/model_repository/yolov8n_onnx/1"

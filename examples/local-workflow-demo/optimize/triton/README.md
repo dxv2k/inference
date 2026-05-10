@@ -27,14 +27,30 @@ bash optimize/triton/export_to_onnx.sh
 ```bash
 bash optimize/triton/start_triton.sh
 # Waits for /v2/health/ready, prints endpoints when up.
-# gRPC on :8001, HTTP on :8000, Prometheus metrics on :8002.
+# Default host ports (override with HTTP_PORT / GRPC_PORT / METRICS_PORT env):
+#   gRPC on :18001  ← use this in the demo's UI
+#   HTTP on :18000
+#   Prometheus metrics on :18002
 ```
 
 Smoke check:
 ```bash
-curl -s http://localhost:8000/v2/models/yolov8n_onnx | python -m json.tool
-# Should report state: READY
+curl -s http://localhost:18000/v2/models/yolov8n_onnx | python -m json.tool
+# Should report platform "onnxruntime_onnx" and versions ["1"]
 ```
+
+## 2a. Performance note (single-frame vs multi-camera)
+
+For **one camera at a time**, Triton is *slower* than the PyTorch path
+(~64 ms vs ~22 ms in our box) — the gRPC round-trip + Python pre/post
+(letterbox + NMS) eats more than the model itself. Triton's win is
+**dynamic batching across multiple cameras**: 4 cameras through Triton
+all share one batched GPU call (~22 ms total), while the PyTorch path
+would do 4×22 = 88 ms in serial.
+
+Don't switch the toggle to Triton expecting a single-camera speedup —
+switch it when you start running `run_multi_camera({...})` from
+`rtsp_runner.py`.
 
 ## 3. Install the Triton client
 

@@ -955,7 +955,7 @@ Plugged in via `WORKFLOWS_PLUGINS=local_yolo_plugin`. **No API key, no cloud, no
                         label="Detector backend (swap the YOLO step — everything downstream stays the same)",
                     )
                     triton_url_real = gr.Textbox(
-                        value="localhost:8001", label="Triton gRPC URL", scale=1,
+                        value="localhost:18001", label="Triton gRPC URL", scale=1,
                         info="ignored when backend is PyTorch",
                     )
                     triton_model_real = gr.Textbox(
@@ -1013,7 +1013,7 @@ No API key, no cloud. Plugged in via the same `WORKFLOWS_PLUGINS=local_yolo_plug
                         choices=BACKEND_CHOICES, value=BACKEND_CHOICES[0],
                         label="Detector backend",
                     )
-                    triton_url_smart = gr.Textbox(value="localhost:8001", label="Triton gRPC URL", scale=1,
+                    triton_url_smart = gr.Textbox(value="localhost:18001", label="Triton gRPC URL", scale=1,
                                                   info="ignored when backend is PyTorch")
                     triton_model_smart = gr.Textbox(value="yolov8n_onnx", label="Triton model name", scale=1)
             gr.Markdown("### Real Roboflow smart-camera workflow pipeline")
