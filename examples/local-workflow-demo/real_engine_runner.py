@@ -35,7 +35,7 @@ def _triton_available() -> bool:
 
 
 TRITON_AVAILABLE = _triton_available()
-_PLUGINS = ["local_yolo_plugin"]
+_PLUGINS = ["local_yolo_plugin", "yolo_world_plugin"]
 if TRITON_AVAILABLE:
     _PLUGINS.append("optimize.triton.triton_yolo_plugin")
 os.environ.setdefault("WORKFLOWS_PLUGINS", ",".join(_PLUGINS))
@@ -218,9 +218,60 @@ def make_smart_workflow(backend: str = "pytorch") -> dict:
     }
 
 
+def make_autoannotate_workflow() -> dict:
+    """Open-vocabulary auto-annotation: YOLO-World detector + box/label viz.
+    No tracking or temporal blocks — designed for single-image batches.
+    """
+    return {
+        "version": "1.0",
+        "inputs": [
+            {"type": "WorkflowImage", "name": "image"},
+            {"type": "WorkflowParameter", "name": "prompts",
+             "default_value": ["person", "car", "dog"]},
+            {"type": "WorkflowParameter", "name": "weights",
+             "default_value": "yolov8s-world.pt"},
+            {"type": "WorkflowParameter", "name": "device", "default_value": "cuda"},
+            {"type": "WorkflowParameter", "name": "conf", "default_value": 0.15},
+        ],
+        "steps": [
+            {
+                "type": "local_models/yolo_world@v1",
+                "name": "detect",
+                "images": "$inputs.image",
+                "weights": "$inputs.weights",
+                "device": "$inputs.device",
+                "confidence": "$inputs.conf",
+                "prompts": "$inputs.prompts",
+            },
+            {
+                "type": "roboflow_core/bounding_box_visualization@v1",
+                "name": "boxes",
+                "image": "$inputs.image",
+                "predictions": "$steps.detect.predictions",
+                "thickness": 2,
+                "copy_image": True,
+            },
+            {
+                "type": "roboflow_core/label_visualization@v1",
+                "name": "labels",
+                "image": "$steps.boxes.image",
+                "predictions": "$steps.detect.predictions",
+                "text": "Class and Confidence",
+                "text_position": "TOP_LEFT",
+                "copy_image": False,
+            },
+        ],
+        "outputs": [
+            {"type": "JsonField", "name": "annotated", "selector": "$steps.labels.image"},
+            {"type": "JsonField", "name": "detections", "selector": "$steps.detect.predictions"},
+        ],
+    }
+
+
 # Backwards compatibility: existing call sites that import the static specs.
 REAL_SPEED_WORKFLOW: dict = make_speed_workflow("pytorch")
 SMART_CAMERA_WORKFLOW: dict = make_smart_workflow("pytorch")
+AUTOANNOTATE_WORKFLOW: dict = make_autoannotate_workflow()
 
 
 def _build_model_manager() -> ModelManager:
@@ -249,7 +300,14 @@ _PERSISTENT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wf-
 _ENGINE_CACHE: dict[tuple[str, str], ExecutionEngine] = {}
 
 
-def _engine_for(workflow: str, backend: str) -> ExecutionEngine:
+_WORKFLOW_FACTORIES = {
+    "speed": make_speed_workflow,
+    "smart": make_smart_workflow,
+    "autoannotate": lambda _backend: make_autoannotate_workflow(),  # backend-agnostic
+}
+
+
+def _engine_for(workflow: str, backend: str = "pytorch") -> ExecutionEngine:
     key = (workflow, backend)
     if key not in _ENGINE_CACHE:
         if backend == "triton" and not TRITON_AVAILABLE:
@@ -257,7 +315,10 @@ def _engine_for(workflow: str, backend: str) -> ExecutionEngine:
                 "Triton backend selected but tritonclient is not installed. "
                 "Install with: uv pip install 'tritonclient[grpc]'"
             )
-        spec = make_speed_workflow(backend) if workflow == "speed" else make_smart_workflow(backend)
+        factory = _WORKFLOW_FACTORIES.get(workflow)
+        if factory is None:
+            raise ValueError(f"unknown workflow type: {workflow!r}")
+        spec = factory(backend)
         _ENGINE_CACHE[key] = ExecutionEngine.init(
             workflow_definition=spec,
             init_parameters=_make_init_parameters(),
@@ -273,6 +334,10 @@ def init_engine(backend: str = "pytorch") -> ExecutionEngine:
 
 def init_smart_engine(backend: str = "pytorch") -> ExecutionEngine:
     return _engine_for("smart", backend)
+
+
+def init_autoannotate_engine() -> ExecutionEngine:
+    return _engine_for("autoannotate", "pytorch")
 
 
 def reset_engine_cache() -> None:
@@ -377,6 +442,31 @@ def run_smart_on_frame(
     }
     t0 = time.perf_counter()
     result = engine.run(runtime_parameters=runtime)
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    out = result[0]
+    return _unwrap_image(out["annotated"]), out["detections"], elapsed_ms
+
+
+
+def run_autoannotate_on_image(
+    engine: ExecutionEngine,
+    image_rgb: np.ndarray,
+    prompts: list[str],
+    confidence: float = 0.15,
+    weights: str = "yolov8s-world.pt",
+    device: str = "cuda",
+) -> tuple[np.ndarray, Any, int]:
+    """Single-image auto-annotation. No video metadata needed — the workflow
+    has no temporal blocks (no tracker, no velocity, no zone)."""
+    img = wrap_frame(image_rgb, "autoannotate", 1, 1.0)
+    t0 = time.perf_counter()
+    result = engine.run(runtime_parameters={
+        "image": [img],
+        "prompts": list(prompts),
+        "weights": weights,
+        "device": device,
+        "conf": float(confidence),
+    })
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     out = result[0]
     return _unwrap_image(out["annotated"]), out["detections"], elapsed_ms

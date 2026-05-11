@@ -773,6 +773,113 @@ def stream_real_smart(source_choice, conf, keep_classes_sel, backend, triton_url
         yield annotated, smart_real_summary_md(detections, total_ms, backend), diagram, spec_json
 
 
+def render_autoannotate_diagram() -> np.ndarray:
+    spec = {
+        "version": "1.0",
+        "name": "real-roboflow-autoannotate",
+        "stages": [
+            {"name": "detect", "type": "object_detection",
+             "params": {"block": "local_models/yolo_world@v1",
+                        "weights": "yolov8s-world.pt", "prompts": "$inputs.prompts"}},
+            {"name": "boxes", "type": "annotate",
+             "params": {"block": "bounding_box_visualization@v1"}},
+            {"name": "labels", "type": "annotate",
+             "params": {"block": "label_visualization@v1"}},
+        ],
+    }
+    return render_workflow_diagram(spec)
+
+
+def _detections_to_coco(detections, image_shape: tuple[int, int],
+                       image_filename: str = "image.jpg") -> dict:
+    """sv.Detections -> COCO JSON dict (single-image annotation)."""
+    h, w = image_shape[:2]
+    classes = list(detections.data.get("class_name", []))
+    cat_map = {}
+    annotations = []
+    for i in range(len(detections)):
+        cls = classes[i] if i < len(classes) else "obj"
+        if cls not in cat_map:
+            cat_map[cls] = len(cat_map) + 1
+        x1, y1, x2, y2 = [float(v) for v in detections.xyxy[i]]
+        annotations.append({
+            "id": i + 1,
+            "image_id": 1,
+            "category_id": cat_map[cls],
+            "bbox": [x1, y1, x2 - x1, y2 - y1],   # COCO is xywh
+            "area": float((x2 - x1) * (y2 - y1)),
+            "iscrowd": 0,
+            "score": float(detections.confidence[i]) if detections.confidence is not None else 1.0,
+        })
+    return {
+        "images": [{"id": 1, "file_name": image_filename, "width": int(w), "height": int(h)}],
+        "categories": [{"id": cid, "name": name} for name, cid in cat_map.items()],
+        "annotations": annotations,
+    }
+
+
+def _detections_to_yolo_txt(detections, image_shape: tuple[int, int],
+                            prompts: list[str]) -> str:
+    """sv.Detections -> YOLO TXT (one row per detection):
+       `class_id cx cy w h`   (all normalized 0-1, cx/cy = center)."""
+    h, w = image_shape[:2]
+    classes = list(detections.data.get("class_name", []))
+    prompt_index = {name: idx for idx, name in enumerate(prompts)}
+    lines = []
+    for i in range(len(detections)):
+        cls = classes[i] if i < len(classes) else "obj"
+        cls_id = prompt_index.get(cls, 0)
+        x1, y1, x2, y2 = [float(v) for v in detections.xyxy[i]]
+        cx = ((x1 + x2) / 2) / w
+        cy = ((y1 + y2) / 2) / h
+        bw = (x2 - x1) / w
+        bh = (y2 - y1) / h
+        lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+    return "\n".join(lines)
+
+
+def run_autoannotate(image, prompts_text, confidence, weights):
+    if image is None:
+        return None, "_drop an image to auto-annotate_", "", "", render_autoannotate_diagram(), ""
+    prompts = [p.strip() for p in prompts_text.split(",") if p.strip()]
+    if not prompts:
+        return image, "_enter at least one class prompt_", "", "", render_autoannotate_diagram(), ""
+
+    engine = rer.init_autoannotate_engine()
+    try:
+        annotated, detections, total_ms = rer.run_autoannotate_on_image(
+            engine, image, prompts=prompts, confidence=float(confidence),
+            weights=str(weights), device=DEVICE,
+        )
+    except Exception as e:
+        return image, f"_engine error: {e}_", "", "", render_autoannotate_diagram(), ""
+
+    n = len(detections)
+    classes = list(detections.data.get("class_name", []))
+    confs = list(detections.confidence) if detections.confidence is not None else []
+    by_class: dict[str, int] = {}
+    for c in classes:
+        by_class[c] = by_class.get(c, 0) + 1
+    by_class_rows = "\n".join(f"| {c} | {n} |" for c, n in sorted(
+        by_class.items(), key=lambda x: -x[1])) or "| — | 0 |"
+    summary = f"""### Auto-annotation — {total_ms} ms on {DEVICE.upper()}
+
+**Model:** `{weights}`  ·  **Prompts:** `{', '.join(prompts)}`
+**Detections:** {n}  ·  **Mean confidence:** {(sum(confs)/len(confs)) if confs else 0:.2f}
+
+#### Counts by class
+| Class | Count |
+|---|---|
+{by_class_rows}
+
+_Pipeline: `local_models/yolo_world@v1` → `bounding_box_visualization@v1` → `label_visualization@v1`_
+"""
+    coco_json = json.dumps(_detections_to_coco(detections, image.shape), indent=2)
+    yolo_txt = _detections_to_yolo_txt(detections, image.shape, prompts)
+    spec_json = json.dumps(rer.AUTOANNOTATE_WORKFLOW, indent=2)
+    return annotated, summary, coco_json, yolo_txt, render_autoannotate_diagram(), spec_json
+
+
 theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="cyan")
 
 with gr.Blocks(title=DEMO_TITLE) as demo:
@@ -790,6 +897,7 @@ Swap the spec — get a completely different AI capability. All self-hosted on t
 | **4** | **REAL Roboflow `ExecutionEngine`** | LocalYOLO + ByteTrack + Velocity | Speed estimation — backend swappable: **PyTorch** or **Triton** |
 | **5** | **REAL Roboflow `ExecutionEngine`** | LocalYOLO + ByteTrack + TimeInZone | Smart camera — backend swappable: **PyTorch** or **Triton** |
 | **6** | **REAL Roboflow `ExecutionEngine`** | RTSP → Tab-4 / Tab-5 workflow → webhook callback | Production pattern: RTSP URL + your alert API URL, backend swappable |
+| **7** | **REAL Roboflow `ExecutionEngine`** | YOLO-World (open-vocab) | Auto-annotation: type any class names, get bboxes + COCO/YOLO export |
 
 _Triton backend appears as an option only when `tritonclient` is installed AND the `optimize.triton.triton_yolo_plugin` is loaded. See `BACKENDS.md` and `optimize/triton/README.md`._
 """)
@@ -1137,11 +1245,73 @@ pipeline.join()  # blocks; auto-reconnects on stream drop via watchdog
                 outputs=[rtsp_img, rtsp_summary, rtsp_alerts],
             )
 
+        with gr.TabItem("7 · Auto-annotation (YOLO-World)", id=6):
+            gr.Markdown("""### Use-case: open-vocabulary auto-annotation
+**No fine-tuning required.** Drop in an image, type a comma-separated list of class names you want bounding boxes for,
+and get them — plus exportable labels in COCO JSON and YOLO TXT format. Useful for bootstrapping a dataset before training.
+
+Powered by `local_models/yolo_world@v1` — our `yolo_world_plugin.py` wrapping Ultralytics' YOLO-World. Same plugin pattern as
+the YOLOv8n block, but the model takes class prompts at inference time via CLIP text encoding.
+
+| Workflow | Steps |
+|---|---|
+| Auto-annotate | `local_models/yolo_world@v1` → `bounding_box_visualization@v1` → `label_visualization@v1` |
+
+**Tip:** YOLO-World scores are typically lower than COCO YOLO, so start with conf=0.10–0.15.
+""")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    aa_img_in = gr.Image(type="numpy", label="Input image", height=320)
+                    if SAMPLE_DIR.exists():
+                        _aa_samples = sorted(str(p) for p in SAMPLE_DIR.glob("*.jpg"))
+                        if _aa_samples:
+                            gr.Examples(examples=_aa_samples, inputs=aa_img_in, label="Sample images")
+                    aa_prompts = gr.Textbox(
+                        value="person, bus, traffic light, backpack, dog, cat, bicycle",
+                        label="Class prompts (comma-separated)",
+                        info="Re-encoded by CLIP only when the list changes; cheap to swap.",
+                    )
+                    with gr.Row():
+                        aa_conf = gr.Slider(0.01, 0.9, value=0.10, step=0.01,
+                                            label="Confidence threshold")
+                        aa_weights = gr.Dropdown(
+                            choices=[
+                                "yolov8s-world.pt",
+                                "yolov8m-world.pt",
+                                "yolov8l-world.pt",
+                                "yolov8x-world.pt",
+                            ],
+                            value="yolov8s-world.pt",
+                            label="YOLO-World checkpoint",
+                            info="Larger = more accurate, slower; downloaded on first use.",
+                        )
+                    aa_btn = gr.Button("Auto-annotate", variant="primary", size="lg")
+                with gr.Column(scale=2):
+                    aa_img_out = gr.Image(label="Annotated output", height=480)
+                    aa_summary = gr.Markdown()
+            with gr.Tabs():
+                with gr.TabItem("COCO JSON"):
+                    aa_coco = gr.Code(language="json", label="coco.json", lines=18)
+                with gr.TabItem("YOLO TXT"):
+                    aa_yolo = gr.Code(language="markdown", label="image.txt (class_id cx cy w h, normalized)", lines=18)
+                with gr.TabItem("Workflow JSON"):
+                    aa_spec = gr.Code(language="json", label="autoannotate.json", lines=20,
+                                      value=json.dumps(rer.AUTOANNOTATE_WORKFLOW, indent=2))
+            gr.Markdown("### Workflow pipeline")
+            aa_diagram = gr.Image(label="Stages", show_label=False, height=180,
+                                  value=render_autoannotate_diagram())
+            aa_btn.click(
+                run_autoannotate,
+                inputs=[aa_img_in, aa_prompts, aa_conf, aa_weights],
+                outputs=[aa_img_out, aa_summary, aa_coco, aa_yolo, aa_diagram, aa_spec],
+            )
+
     gr.Markdown("---")
-    gr.Markdown(f"_YOLOv8n COCO · {DEVICE.upper()} · "
+    gr.Markdown(f"_{DEVICE.upper()} · "
                 f"Tabs 1-3 use our hand-rolled engine (`workflow.py`); "
-                f"Tabs 4-6 use the **real** Roboflow `ExecutionEngine` driven by our `local_yolo_plugin`. "
-                f"No Roboflow API key required. Tab 6 demonstrates the production RTSP→webhook pattern._")
+                f"Tabs 4-6 use the **real** Roboflow `ExecutionEngine` driven by `local_yolo_plugin` (PyTorch or Triton). "
+                f"Tab 7 uses `yolo_world_plugin` for open-vocabulary auto-annotation. "
+                f"No Roboflow API key required._")
 
 
 if __name__ == "__main__":
