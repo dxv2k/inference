@@ -470,3 +470,37 @@ def run_autoannotate_on_image(
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     out = result[0]
     return _unwrap_image(out["annotated"]), out["detections"], elapsed_ms
+
+
+def run_autoannotate_batch(
+    engine: ExecutionEngine,
+    images_rgb: list[np.ndarray],
+    prompts: list[str],
+    confidence: float = 0.15,
+    weights: str = "yolov8s-world.pt",
+    device: str = "cuda",
+    batch_size: int = 8,
+) -> list[tuple[np.ndarray, Any]]:
+    """Auto-annotate N images. Internally chunked into batches of `batch_size`
+    so each engine.run() exercises the plugin's Batch[WorkflowImageData] path
+    (one YOLO-World forward pass per batch). Returns N tuples of
+    (annotated_rgb, sv.Detections) in the same order as the input list."""
+    if not images_rgb:
+        return []
+    all_results: list[tuple[np.ndarray, Any]] = []
+    for chunk_start in range(0, len(images_rgb), batch_size):
+        chunk = images_rgb[chunk_start:chunk_start + batch_size]
+        wrapped = [
+            wrap_frame(img, f"autoannotate-{chunk_start + i}", chunk_start + i, 1.0)
+            for i, img in enumerate(chunk)
+        ]
+        result = engine.run(runtime_parameters={
+            "image": wrapped,
+            "prompts": list(prompts),
+            "weights": weights,
+            "device": device,
+            "conf": float(confidence),
+        })
+        for r in result:
+            all_results.append((_unwrap_image(r["annotated"]), r["detections"]))
+    return all_results

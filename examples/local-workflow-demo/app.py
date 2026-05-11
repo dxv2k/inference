@@ -838,46 +838,170 @@ def _detections_to_yolo_txt(detections, image_shape: tuple[int, int],
     return "\n".join(lines)
 
 
-def run_autoannotate(image, prompts_text, confidence, weights):
-    if image is None:
-        return None, "_drop an image to auto-annotate_", "", "", render_autoannotate_diagram(), ""
+def _build_coco_for_batch(items: list[tuple[str, np.ndarray, Any]],
+                          prompts: list[str]) -> dict:
+    """items: list of (filename, image_np, sv.Detections). Returns COCO dict
+    spanning all images, categories ordered by prompts list."""
+    cat_map = {name: idx + 1 for idx, name in enumerate(prompts)}
+    images, annotations = [], []
+    ann_id = 1
+    for img_id, (fname, img, dets) in enumerate(items, start=1):
+        h, w = img.shape[:2]
+        images.append({"id": img_id, "file_name": fname,
+                       "width": int(w), "height": int(h)})
+        classes = list(dets.data.get("class_name", []))
+        for i in range(len(dets)):
+            cls = classes[i] if i < len(classes) else "obj"
+            x1, y1, x2, y2 = [float(v) for v in dets.xyxy[i]]
+            annotations.append({
+                "id": ann_id,
+                "image_id": img_id,
+                "category_id": cat_map.get(cls, 1),
+                "bbox": [x1, y1, x2 - x1, y2 - y1],
+                "area": float((x2 - x1) * (y2 - y1)),
+                "iscrowd": 0,
+                "score": float(dets.confidence[i]) if dets.confidence is not None else 1.0,
+            })
+            ann_id += 1
+    return {
+        "images": images,
+        "categories": [{"id": cid, "name": name} for name, cid in cat_map.items()],
+        "annotations": annotations,
+    }
+
+
+def _build_yolo_zip(items: list[tuple[str, np.ndarray, Any]],
+                    prompts: list[str], include_annotated: bool = True) -> str:
+    """items: list of (filename, image_np, sv.Detections). Writes a zip with:
+       - labels/<stem>.txt   YOLO format (class_id cx cy w h, normalized)
+       - classes.txt         one class per line, line N == class N
+       - annotated/<stem>.jpg   visual annotated copies (optional)
+    Returns path to the zip file."""
+    import io, zipfile, tempfile
+    prompt_index = {name: idx for idx, name in enumerate(prompts)}
+    f = tempfile.NamedTemporaryFile(prefix="autoannotate-", suffix=".zip", delete=False)
+    f.close()
+    with zipfile.ZipFile(f.name, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("classes.txt", "\n".join(prompts) + "\n")
+        for fname, img, dets in items:
+            stem = Path(fname).stem
+            h, w = img.shape[:2]
+            lines = []
+            classes = list(dets.data.get("class_name", []))
+            for i in range(len(dets)):
+                cls = classes[i] if i < len(classes) else "obj"
+                cls_id = prompt_index.get(cls, 0)
+                x1, y1, x2, y2 = [float(v) for v in dets.xyxy[i]]
+                cx = ((x1 + x2) / 2) / w
+                cy = ((y1 + y2) / 2) / h
+                bw = (x2 - x1) / w
+                bh = (y2 - y1) / h
+                lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+            zf.writestr(f"labels/{stem}.txt", "\n".join(lines) + ("\n" if lines else ""))
+            if include_annotated:
+                ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                if ok:
+                    zf.writestr(f"annotated/{stem}.jpg", buf.tobytes())
+    return f.name
+
+
+def _read_images_from_files(files: list[Any]) -> list[tuple[str, np.ndarray]]:
+    """gr.Files yields a list whose elements have .name (filepath) on Gradio 4+
+    or are bare path strings. Be defensive."""
+    out: list[tuple[str, np.ndarray]] = []
+    for f in files or []:
+        path = getattr(f, "name", None) or (f if isinstance(f, str) else None)
+        if not path:
+            continue
+        img_bgr = cv2.imread(path)
+        if img_bgr is None:
+            continue
+        out.append((Path(path).name, cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)))
+    return out
+
+
+def run_autoannotate(files, prompts_text, confidence, weights, batch_size, progress=gr.Progress()):
+    if not files:
+        return ([], "_drop one or more images to auto-annotate_",
+                "", None, render_autoannotate_diagram(), "")
     prompts = [p.strip() for p in prompts_text.split(",") if p.strip()]
     if not prompts:
-        return image, "_enter at least one class prompt_", "", "", render_autoannotate_diagram(), ""
+        return ([], "_enter at least one class prompt_",
+                "", None, render_autoannotate_diagram(), "")
 
+    progress(0, desc="loading images")
+    inputs = _read_images_from_files(files)
+    if not inputs:
+        return ([], "_no decodable images among the uploaded files_",
+                "", None, render_autoannotate_diagram(), "")
+
+    progress(0.1, desc=f"initializing engine ({weights})")
     engine = rer.init_autoannotate_engine()
-    try:
-        annotated, detections, total_ms = rer.run_autoannotate_on_image(
-            engine, image, prompts=prompts, confidence=float(confidence),
-            weights=str(weights), device=DEVICE,
-        )
-    except Exception as e:
-        return image, f"_engine error: {e}_", "", "", render_autoannotate_diagram(), ""
 
-    n = len(detections)
-    classes = list(detections.data.get("class_name", []))
-    confs = list(detections.confidence) if detections.confidence is not None else []
+    fnames = [n for n, _ in inputs]
+    images = [im for _, im in inputs]
+
+    # Chunk through the engine, reporting progress per batch
+    bsz = int(batch_size)
+    items: list[tuple[str, np.ndarray, Any]] = []
+    n_total = len(images)
+    t_start = time.perf_counter()
+    for chunk_start in range(0, n_total, bsz):
+        chunk_imgs = images[chunk_start:chunk_start + bsz]
+        chunk_fnames = fnames[chunk_start:chunk_start + bsz]
+        try:
+            batch_results = rer.run_autoannotate_batch(
+                engine, chunk_imgs, prompts=prompts,
+                confidence=float(confidence), weights=str(weights),
+                device=DEVICE, batch_size=bsz,
+            )
+        except Exception as e:
+            return ([], f"_engine error: {e}_", "", None,
+                    render_autoannotate_diagram(),
+                    json.dumps(rer.AUTOANNOTATE_WORKFLOW, indent=2))
+        for fn, (ann, dets) in zip(chunk_fnames, batch_results):
+            items.append((fn, ann, dets))
+        progress((chunk_start + len(chunk_imgs)) / n_total,
+                 desc=f"{chunk_start + len(chunk_imgs)} / {n_total} images")
+    wall = time.perf_counter() - t_start
+
+    # Aggregate stats
+    total_dets = sum(len(d) for _, _, d in items)
+    images_with_dets = sum(1 for _, _, d in items if len(d) > 0)
     by_class: dict[str, int] = {}
-    for c in classes:
-        by_class[c] = by_class.get(c, 0) + 1
+    for _, _, dets in items:
+        for c in list(dets.data.get("class_name", [])):
+            by_class[c] = by_class.get(c, 0) + 1
     by_class_rows = "\n".join(f"| {c} | {n} |" for c, n in sorted(
         by_class.items(), key=lambda x: -x[1])) or "| — | 0 |"
-    summary = f"""### Auto-annotation — {total_ms} ms on {DEVICE.upper()}
+    fps = (n_total / wall) if wall > 0 else 0
+    summary = f"""### Auto-annotation — {n_total} images in {wall:.1f}s  ({fps:.1f} img/s)
 
-**Model:** `{weights}`  ·  **Prompts:** `{', '.join(prompts)}`
-**Detections:** {n}  ·  **Mean confidence:** {(sum(confs)/len(confs)) if confs else 0:.2f}
+**Model:** `{weights}`  ·  **Prompts ({len(prompts)}):** `{', '.join(prompts)}`
+**Batch size:** {bsz}  ·  **Images with ≥1 detection:** {images_with_dets} / {n_total}
+**Total detections:** {total_dets}
 
-#### Counts by class
+#### Counts by class (across all images)
 | Class | Count |
 |---|---|
 {by_class_rows}
 
-_Pipeline: `local_models/yolo_world@v1` → `bounding_box_visualization@v1` → `label_visualization@v1`_
+_Pipeline: `local_models/yolo_world@v1` → `bounding_box_visualization@v1` → `label_visualization@v1`. Batched through the engine `batch_size={bsz}` images at a time._
 """
-    coco_json = json.dumps(_detections_to_coco(detections, image.shape), indent=2)
-    yolo_txt = _detections_to_yolo_txt(detections, image.shape, prompts)
+
+    # Gallery of annotated previews — cap at 60 to keep the UI snappy
+    GALLERY_CAP = 60
+    gallery = [(ann, f"{fn} · {len(dets)} dets") for fn, ann, dets in items[:GALLERY_CAP]]
+    if len(items) > GALLERY_CAP:
+        gallery.append((items[0][1], f"... + {len(items) - GALLERY_CAP} more (not shown)"))
+
+    progress(0.95, desc="packaging exports")
+    coco_dict = _build_coco_for_batch(items, prompts)
+    coco_json = json.dumps(coco_dict, indent=2)
+    zip_path = _build_yolo_zip(items, prompts, include_annotated=True)
     spec_json = json.dumps(rer.AUTOANNOTATE_WORKFLOW, indent=2)
-    return annotated, summary, coco_json, yolo_txt, render_autoannotate_diagram(), spec_json
+    progress(1.0, desc="done")
+    return gallery, summary, coco_json, zip_path, render_autoannotate_diagram(), spec_json
 
 
 theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="cyan")
@@ -1246,26 +1370,29 @@ pipeline.join()  # blocks; auto-reconnects on stream drop via watchdog
             )
 
         with gr.TabItem("7 · Auto-annotation (YOLO-World)", id=6):
-            gr.Markdown("""### Use-case: open-vocabulary auto-annotation
-**No fine-tuning required.** Drop in an image, type a comma-separated list of class names you want bounding boxes for,
-and get them — plus exportable labels in COCO JSON and YOLO TXT format. Useful for bootstrapping a dataset before training.
+            gr.Markdown("""### Use-case: open-vocabulary batch auto-annotation
+**No fine-tuning required.** Upload a few hundred images, type a comma-separated list of class names,
+get bboxes drawn on every image plus a single COCO JSON and a YOLO-format zip ready to drop into a training run.
 
-Powered by `local_models/yolo_world@v1` — our `yolo_world_plugin.py` wrapping Ultralytics' YOLO-World. Same plugin pattern as
-the YOLOv8n block, but the model takes class prompts at inference time via CLIP text encoding.
+Powered by `local_models/yolo_world@v1` — our `yolo_world_plugin.py` wrapping Ultralytics' YOLO-World.
+Images are pushed through the engine in batches of N (slider) so each `engine.run()` calls one batched
+YOLO forward pass.
 
 | Workflow | Steps |
 |---|---|
 | Auto-annotate | `local_models/yolo_world@v1` → `bounding_box_visualization@v1` → `label_visualization@v1` |
 
-**Tip:** YOLO-World scores are typically lower than COCO YOLO, so start with conf=0.10–0.15.
+**Tip:** YOLO-World scores run lower than COCO YOLO. Start with conf=0.10–0.15.
+**Throughput on this box:** ~30 images/sec at batch=8 with `yolov8s-world.pt`. Larger checkpoints are slower.
 """)
             with gr.Row():
                 with gr.Column(scale=1):
-                    aa_img_in = gr.Image(type="numpy", label="Input image", height=320)
-                    if SAMPLE_DIR.exists():
-                        _aa_samples = sorted(str(p) for p in SAMPLE_DIR.glob("*.jpg"))
-                        if _aa_samples:
-                            gr.Examples(examples=_aa_samples, inputs=aa_img_in, label="Sample images")
+                    aa_files_in = gr.File(
+                        label="Images to annotate (drag-drop many)",
+                        file_count="multiple",
+                        file_types=["image"],
+                        height=200,
+                    )
                     aa_prompts = gr.Textbox(
                         value="person, bus, traffic light, backpack, dog, cat, bicycle",
                         label="Class prompts (comma-separated)",
@@ -1274,36 +1401,53 @@ the YOLOv8n block, but the model takes class prompts at inference time via CLIP 
                     with gr.Row():
                         aa_conf = gr.Slider(0.01, 0.9, value=0.10, step=0.01,
                                             label="Confidence threshold")
-                        aa_weights = gr.Dropdown(
-                            choices=[
-                                "yolov8s-world.pt",
-                                "yolov8m-world.pt",
-                                "yolov8l-world.pt",
-                                "yolov8x-world.pt",
-                            ],
-                            value="yolov8s-world.pt",
-                            label="YOLO-World checkpoint",
-                            info="Larger = more accurate, slower; downloaded on first use.",
-                        )
-                    aa_btn = gr.Button("Auto-annotate", variant="primary", size="lg")
+                        aa_batch = gr.Slider(1, 16, value=8, step=1,
+                                             label="Batch size",
+                                             info="Images per engine.run() call. Bigger = fewer Python boundary crossings, more GPU memory.")
+                    aa_weights = gr.Dropdown(
+                        choices=[
+                            "yolov8s-world.pt",
+                            "yolov8m-world.pt",
+                            "yolov8l-world.pt",
+                            "yolov8x-world.pt",
+                        ],
+                        value="yolov8s-world.pt",
+                        label="YOLO-World checkpoint",
+                        info="Larger = more accurate, slower; downloaded on first use.",
+                    )
+                    aa_btn = gr.Button("Auto-annotate batch", variant="primary", size="lg")
                 with gr.Column(scale=2):
-                    aa_img_out = gr.Image(label="Annotated output", height=480)
+                    aa_gallery = gr.Gallery(
+                        label="Annotated previews",
+                        columns=4, rows=2, height=480,
+                        show_label=True, object_fit="contain",
+                    )
                     aa_summary = gr.Markdown()
             with gr.Tabs():
-                with gr.TabItem("COCO JSON"):
-                    aa_coco = gr.Code(language="json", label="coco.json", lines=18)
-                with gr.TabItem("YOLO TXT"):
-                    aa_yolo = gr.Code(language="markdown", label="image.txt (class_id cx cy w h, normalized)", lines=18)
-                with gr.TabItem("Workflow JSON"):
-                    aa_spec = gr.Code(language="json", label="autoannotate.json", lines=20,
+                with gr.TabItem("YOLO labels (download zip)"):
+                    gr.Markdown(
+                        "Contains `labels/<stem>.txt` (one per image, normalized "
+                        "`class_id cx cy w h`), `classes.txt`, and `annotated/<stem>.jpg` previews. "
+                        "Drop into a YOLO training directory and adjust `data.yaml` accordingly."
+                    )
+                    aa_zip = gr.File(label="autoannotate.zip", height=80)
+                with gr.TabItem("COCO JSON (all images)"):
+                    gr.Markdown(
+                        "Single COCO-format dict with one `images` entry per input file and "
+                        "one `annotations` entry per detection. Use directly with FiftyOne / "
+                        "Roboflow / COCO-eval / Label Studio."
+                    )
+                    aa_coco = gr.Code(language="json", label="coco.json", lines=20)
+                with gr.TabItem("Workflow JSON spec"):
+                    aa_spec = gr.Code(language="json", label="autoannotate.json", lines=22,
                                       value=json.dumps(rer.AUTOANNOTATE_WORKFLOW, indent=2))
             gr.Markdown("### Workflow pipeline")
             aa_diagram = gr.Image(label="Stages", show_label=False, height=180,
                                   value=render_autoannotate_diagram())
             aa_btn.click(
                 run_autoannotate,
-                inputs=[aa_img_in, aa_prompts, aa_conf, aa_weights],
-                outputs=[aa_img_out, aa_summary, aa_coco, aa_yolo, aa_diagram, aa_spec],
+                inputs=[aa_files_in, aa_prompts, aa_conf, aa_weights, aa_batch],
+                outputs=[aa_gallery, aa_summary, aa_coco, aa_zip, aa_diagram, aa_spec],
             )
 
     gr.Markdown("---")
