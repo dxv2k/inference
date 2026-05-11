@@ -24,3 +24,10 @@ saved_workflows/*.json
 *.swp
 .idea/
 .vscode/
+
+# Auto-downloaded model weights — anything Ultralytics pulls down at runtime
+*.pt
+*.onnx
+*.engine
+yolov8n.pt
+
