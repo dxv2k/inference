@@ -1106,6 +1106,251 @@ Both steps ran through the Roboflow `ExecutionEngine`:
     return gallery, zip_path, summary
 
 
+def render_sam3_realtime_diagram() -> np.ndarray:
+    """Diagram for Tab 9 — VLM (once) → SAM3 (per frame) → boxes + labels."""
+    spec = {
+        "version": "1.0",
+        "name": "sam3-real-time-alert",
+        "stages": [
+            {"name": "vlm", "type": "object_detection",
+             "params": {"block": "roboflow_core/openai_compatible@v1",
+                        "model": "google/gemini-3.1-flash-lite",
+                        "from": "first RTSP frame",
+                        "runs": "ONCE"}},
+            {"name": "sam3", "type": "object_detection",
+             "params": {"block": "local_models/sam3@v1",
+                        "weights": "HF facebook/sam3",
+                        "prompts": "$steps.vlm.classes",
+                        "runs": "per frame"}},
+            {"name": "boxes",  "type": "annotate",
+             "params": {"block": "bounding_box_visualization@v1"}},
+            {"name": "labels", "type": "annotate",
+             "params": {"block": "label_visualization@v1"}},
+        ],
+    }
+    return render_workflow_diagram(spec)
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * (pct / 100.0)
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    if f == c:
+        return s[f]
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def stream_sam3_realtime(rtsp_url, user_context, alert_url, conf, frame_skip, alert_cooldown_s):
+    """Tab 9 — SAM3 real-time alert.
+    Pipeline: prompt → VLM (once, OpenRouter via workflow engine) → SAM3 per frame (self-hosted) → boxes + labels.
+    Yields (annotated_image, prompts_md, perf_md, alerts_md) per processed frame.
+    SAM3 is intentionally slow (~10s/prompt × N prompts on a 3090). We surface the real numbers."""
+    from collections import deque
+    import statistics
+
+    if not rtsp_url or not rtsp_url.strip():
+        yield None, "_paste an RTSP URL above_", "_idle_", "_no alerts_"
+        return
+    if not rer.vlm_is_configured():
+        yield None, "_OPENROUTER_API_KEY not set. Copy `.env.example` → `.env`._", "_idle_", "_no alerts_"
+        return
+    if not rer.SAM3_AVAILABLE:
+        yield None, "_SAM3 not installed. `uv pip install sam3==0.1.3`._", "_idle_", "_no alerts_"
+        return
+
+    rtsp_url = rtsp_url.strip()
+    frame_skip = max(1, int(frame_skip))
+    cooldown_s = float(alert_cooldown_s)
+
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if not cap.isOpened():
+        yield None, f"_cannot open RTSP URL: {rtsp_url}_", "_idle_", "_no alerts_"
+        return
+
+    # --- Step A: get the first decoded frame, then run VLM ONCE for prompts.
+    first_rgb = None
+    for _ in range(60):
+        ok, frame_bgr = cap.read()
+        if ok and frame_bgr is not None:
+            first_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            break
+        time.sleep(0.05)
+    if first_rgb is None:
+        cap.release()
+        yield None, "_could not decode any frame from RTSP source (60 retries)_", "_idle_", "_no alerts_"
+        return
+
+    h0, w0 = first_rgb.shape[:2]
+    if w0 > 960:
+        s = 960 / w0
+        first_rgb = cv2.resize(first_rgb, (int(w0 * s), int(h0 * s)))
+
+    try:
+        vlm_engine = rer.init_vlm_engine()
+        prompts = rer.run_vlm_prompt_suggest(
+            vlm_engine, [first_rgb], user_context=user_context or "",
+        )
+    except Exception as e:
+        cap.release()
+        yield None, f"_VLM engine error: {e}_", "_idle_", "_no alerts_"
+        return
+
+    if not prompts:
+        cap.release()
+        yield None, "_Gemini returned no class names. Try a different stream or add context._", "_idle_", "_no alerts_"
+        return
+
+    prompts_md = (f"### VLM-suggested classes ({len(prompts)})\n"
+                  f"`{', '.join(prompts)}`\n\n"
+                  f"_Picked once via `roboflow_core/openai_compatible@v1` on the first RTSP frame. "
+                  f"Frozen for this run._")
+    # First yield: prompts known, SAM3 hasn't run yet.
+    yield (None, prompts_md,
+           f"### Performance (live)\n_initialising SAM3 on first frame — expect ~{len(prompts)*10}s_",
+           "_no alerts yet_")
+
+    # --- Step B: prepare SAM3 engine + RTSP loop.
+    try:
+        sam3_engine = rer.init_sam3_engine()
+    except RuntimeError as e:
+        cap.release()
+        yield None, prompts_md, f"_SAM3 unavailable: {e}_", "_no alerts_"
+        return
+
+    latencies: deque[float] = deque(maxlen=50)
+    alerts_log: list[str] = []
+    last_alert_for_class: dict[str, float] = {}
+    consecutive_failures = 0
+    frame_idx = 0
+    frames_processed = 0
+    last_detection_count = 0
+    last_latency_s = 0.0
+    stream_t0 = time.time()
+    # The first frame we already decoded is fair game.
+    pending_first = first_rgb
+
+    while True:
+        if pending_first is not None:
+            rgb = pending_first
+            pending_first = None
+            frame_idx += 1
+        else:
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                consecutive_failures += 1
+                if consecutive_failures >= 30:
+                    cap.release()
+                    perf_md = _sam3_perf_md(prompts, latencies, frames_processed,
+                                            stream_t0, last_latency_s, last_detection_count,
+                                            note="RTSP stream lost (30 consecutive read failures)")
+                    yield None, prompts_md, perf_md, _alerts_md(alerts_log)
+                    return
+                time.sleep(0.05)
+                continue
+            consecutive_failures = 0
+            frame_idx += 1
+            if frame_idx % frame_skip != 0:
+                continue
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            if w > 960:
+                s = 960 / w
+                rgb = cv2.resize(rgb, (int(w * s), int(h * s)))
+
+        # SAM3 forward — this is the slow step.
+        t0 = time.perf_counter()
+        try:
+            batch = rer.run_sam3_batch(
+                sam3_engine, [rgb], prompts=prompts,
+                confidence=float(conf), batch_size=1,
+            )
+        except Exception as e:
+            cap.release()
+            perf_md = _sam3_perf_md(prompts, latencies, frames_processed,
+                                    stream_t0, last_latency_s, last_detection_count,
+                                    note=f"SAM3 engine error: {e}")
+            yield None, prompts_md, perf_md, _alerts_md(alerts_log)
+            return
+        last_latency_s = time.perf_counter() - t0
+        latencies.append(last_latency_s)
+        frames_processed += 1
+
+        annotated, dets = batch[0]
+        last_detection_count = len(dets)
+
+        # Alerts: per-class cooldown.
+        if last_detection_count > 0:
+            ts_iso = time.strftime("%H:%M:%S")
+            classes = list(dets.data.get("class_name", [])) if hasattr(dets, "data") else []
+            confidences = list(dets.confidence) if dets.confidence is not None else []
+            now = time.time()
+            # Aggregate best conf per class for this frame.
+            best_for_class: dict[str, float] = {}
+            for i, cls in enumerate(classes):
+                cval = float(confidences[i]) if i < len(confidences) else 1.0
+                if cls not in best_for_class or cval > best_for_class[cls]:
+                    best_for_class[cls] = cval
+            for cls, best_conf in best_for_class.items():
+                if now - last_alert_for_class.get(cls, 0.0) < cooldown_s:
+                    continue
+                last_alert_for_class[cls] = now
+                line = f"`{ts_iso}` · **{cls}** · conf {best_conf:.2f}"
+                if alert_url and alert_url.strip():
+                    try:
+                        import requests
+                        r = requests.post(alert_url.strip(), json={
+                            "camera_id": rtsp_url,
+                            "alert_type": "sam3_detection",
+                            "class": cls,
+                            "confidence": round(best_conf, 3),
+                            "frame_id": frame_idx,
+                            "ts": ts_iso,
+                            "prompts": prompts,
+                            "all_detected_classes": sorted(best_for_class.keys()),
+                        }, timeout=1.5)
+                        line += f" → POST {r.status_code}"
+                    except Exception as e:
+                        line += f" → POST failed ({type(e).__name__})"
+                else:
+                    line += " · _no webhook configured_"
+                alerts_log.append(line)
+            alerts_log = alerts_log[-15:]
+
+        perf_md = _sam3_perf_md(prompts, latencies, frames_processed,
+                                stream_t0, last_latency_s, last_detection_count)
+        yield annotated, prompts_md, perf_md, _alerts_md(alerts_log)
+
+
+def _sam3_perf_md(prompts, latencies, frames_processed, stream_t0,
+                  last_latency_s, last_detection_count, note: str | None = None) -> str:
+    elapsed = max(time.time() - stream_t0, 1e-6)
+    lats = list(latencies)
+    mean_s = (sum(lats) / len(lats)) if lats else 0.0
+    p50_s = _percentile(lats, 50.0)
+    p95_s = _percentile(lats, 95.0)
+    eff_fps = frames_processed / elapsed
+    note_md = f"\n\n_{note}_" if note else ""
+    return (
+        f"### Performance (live)\n"
+        f"**Frames processed:** {frames_processed}  ·  **Time elapsed:** {elapsed:.1f} s  ·  "
+        f"**Effective fps:** {eff_fps:.2f}\n"
+        f"**Latency (per frame):** mean {mean_s:.1f} s · p50 {p50_s:.1f} s · p95 {p95_s:.1f} s\n"
+        f"**Last frame:** {last_latency_s:.1f} s  ·  **Detections in last frame:** {last_detection_count}\n"
+        f"**Prompts used:** `{', '.join(prompts)}` "
+        f"({len(prompts)} prompts × ~10 s SAM3 forward each on a 3090){note_md}"
+    )
+
+
+def _alerts_md(alerts_log: list[str]) -> str:
+    if not alerts_log:
+        return "_no alerts yet_"
+    return "\n".join(f"- {a}" for a in reversed(alerts_log))
+
+
 theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="cyan")
 
 with gr.Blocks(title=DEMO_TITLE) as demo:
@@ -1125,6 +1370,7 @@ Swap the spec — get a completely different AI capability. All self-hosted on t
 | **6** | **REAL Roboflow `ExecutionEngine`** | RTSP → Tab-4 / Tab-5 workflow → webhook callback | Production pattern: RTSP URL + your alert API URL, backend swappable |
 | **7** | **REAL Roboflow `ExecutionEngine`** | YOLO-World (open-vocab) | Auto-annotation: type any class names, get bboxes + COCO/YOLO export |
 | **8** | **REAL Roboflow `ExecutionEngine`** | Gemini → YOLO-World | VLM picks the classes from sample images, then runs YOLO-World v2 |
+| **9** | **REAL Roboflow `ExecutionEngine`** | Gemini → SAM3 on RTSP | Real-time alerting: VLM picks classes from the first RTSP frame, SAM3 runs per frame, webhook POST per detection |
 
 _Triton backend appears as an option only when `tritonclient` is installed AND the `optimize.triton.triton_yolo_plugin` is loaded. See `BACKENDS.md` and `optimize/triton/README.md`._
 """)
@@ -1611,12 +1857,75 @@ plus engine warmup; subsequent calls are batched-fast.
                 outputs=[aa2_gallery, aa2_zip, aa2_summary],
             )
 
+        with gr.TabItem("9 · SAM3 Real-time Alert (Gemini → SAM3 → RTSP)", id=8):
+            _vlm_ok = rer.vlm_is_configured()
+            _sam3_ok = rer.SAM3_AVAILABLE
+            gr.Markdown(f"""### Real-time alerting: VLM picks classes, SAM3 runs per RTSP frame
+
+**Flow:** `prompt → VLM (once) → SAM3 (every Nth frame) → webhook POST per detection`.
+Only the VLM step touches OpenRouter — SAM3 is fully self-hosted (`local_models/sam3@v1`, weights `facebook/sam3` from HuggingFace).
+
+**Honest numbers.** SAM3 runs **one forward pass per text prompt** (the upstream `sam3` package
+asserts `num_frames == 1`). So with K prompts, expect **K × ~10 s per frame on a 3090**.
+3 prompts ≈ 30 s/frame; effective fps will be in the 0.03–0.1 range. The `Frame skip` slider just
+lowers decode cost — it does not make SAM3 faster.
+
+**Status:** {("`OPENROUTER_API_KEY` detected" if _vlm_ok else "⚠ `OPENROUTER_API_KEY` not set — copy `.env.example` → `.env`")}{(" · SAM3 available." if _sam3_ok else " · ⚠ SAM3 not installed (`uv pip install sam3==0.1.3`).")}
+""")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    sam3rt_url = gr.Textbox(
+                        label="RTSP URL",
+                        value="rtsp://localhost:8554/traffic",
+                        placeholder="rtsp://user:pass@cam.example.com:554/...",
+                    )
+                    sam3rt_use_sim_btn = gr.Button(
+                        "Use simulated traffic RTSP (localhost:8554)", size="sm",
+                    )
+                    sam3rt_context = gr.Textbox(
+                        label="Optional context for the VLM",
+                        placeholder="e.g. urban intersection — focus on vulnerable road users",
+                        lines=2,
+                    )
+                    sam3rt_alert_url = gr.Textbox(
+                        label="Alert webhook URL (optional)",
+                        placeholder="https://your-api.example.com/alerts",
+                    )
+                    sam3rt_conf = gr.Slider(0.05, 0.9, value=0.35, step=0.05,
+                                            label="SAM3 confidence")
+                    sam3rt_skip = gr.Slider(1, 30, value=5, step=1,
+                                            label="Frame skip (process every Nth decoded frame)")
+                    sam3rt_cool = gr.Slider(0.5, 30.0, value=5.0, step=0.5,
+                                            label="Alert cooldown per class (seconds)")
+                    sam3rt_btn = gr.Button("Start", variant="primary", size="lg",
+                                           interactive=_vlm_ok and _sam3_ok)
+                with gr.Column(scale=2):
+                    sam3rt_img = gr.Image(label="SAM3 annotated RTSP stream", streaming=True)
+                    sam3rt_prompts_view = gr.Markdown()
+                    sam3rt_perf_view = gr.Markdown()
+                    sam3rt_alerts_view = gr.Markdown(label="Alerts log")
+            gr.Markdown("### Workflow pipeline (engine.run() calls)")
+            sam3rt_diagram = gr.Image(label="Stages", show_label=False, height=200,
+                                      value=render_sam3_realtime_diagram())
+
+            sam3rt_use_sim_btn.click(
+                lambda: "rtsp://localhost:8554/traffic", outputs=[sam3rt_url],
+            )
+            sam3rt_btn.click(
+                stream_sam3_realtime,
+                inputs=[sam3rt_url, sam3rt_context, sam3rt_alert_url,
+                        sam3rt_conf, sam3rt_skip, sam3rt_cool],
+                outputs=[sam3rt_img, sam3rt_prompts_view,
+                         sam3rt_perf_view, sam3rt_alerts_view],
+            )
+
     gr.Markdown("---")
     gr.Markdown(f"_{DEVICE.upper()} · "
                 f"Tabs 1-3 use our hand-rolled engine (`workflow.py`); "
                 f"Tabs 4-6 use the **real** Roboflow `ExecutionEngine` driven by `local_yolo_plugin` (PyTorch or Triton). "
                 f"Tabs 7-8 use `yolo_world_plugin` for open-vocabulary auto-annotation. "
                 f"Tab 8 adds VLM-suggested class prompts via OpenRouter (the only non-local hop). "
+                f"Tab 9 wires the same VLM-prompted pipeline to live RTSP + SAM3 + webhook alerts (still self-hosted detection). "
                 f"No Roboflow API key required._")
 
 
