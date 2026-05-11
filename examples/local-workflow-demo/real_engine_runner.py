@@ -34,8 +34,19 @@ def _triton_available() -> bool:
         return False
 
 
+def _sam3_available() -> bool:
+    try:
+        import sam3  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 TRITON_AVAILABLE = _triton_available()
+SAM3_AVAILABLE = _sam3_available()
 _PLUGINS = ["local_yolo_plugin", "yolo_world_plugin", "vlm_prompt_plugin"]
+if SAM3_AVAILABLE:
+    _PLUGINS.append("sam3_plugin")
 if TRITON_AVAILABLE:
     _PLUGINS.append("optimize.triton.triton_yolo_plugin")
 os.environ.setdefault("WORKFLOWS_PLUGINS", ",".join(_PLUGINS))
@@ -268,6 +279,51 @@ def make_autoannotate_workflow() -> dict:
     }
 
 
+def make_sam3_autoannotate_workflow() -> dict:
+    """Single-step detection via SAM3 + box/label viz. Drop-in replacement
+    for the YOLO-World autoannotate workflow when you want segmentation-grade
+    bboxes from text prompts."""
+    return {
+        "version": "1.0",
+        "inputs": [
+            {"type": "WorkflowImage", "name": "image"},
+            {"type": "WorkflowParameter", "name": "prompts",
+             "default_value": ["person", "car"]},
+            {"type": "WorkflowParameter", "name": "conf", "default_value": 0.35},
+        ],
+        "steps": [
+            {
+                "type": "local_models/sam3@v1",
+                "name": "detect",
+                "images": "$inputs.image",
+                "prompts": "$inputs.prompts",
+                "confidence": "$inputs.conf",
+            },
+            {
+                "type": "roboflow_core/bounding_box_visualization@v1",
+                "name": "boxes",
+                "image": "$inputs.image",
+                "predictions": "$steps.detect.predictions",
+                "thickness": 2,
+                "copy_image": True,
+            },
+            {
+                "type": "roboflow_core/label_visualization@v1",
+                "name": "labels",
+                "image": "$steps.boxes.image",
+                "predictions": "$steps.detect.predictions",
+                "text": "Class and Confidence",
+                "text_position": "TOP_LEFT",
+                "copy_image": False,
+            },
+        ],
+        "outputs": [
+            {"type": "JsonField", "name": "annotated", "selector": "$steps.labels.image"},
+            {"type": "JsonField", "name": "detections", "selector": "$steps.detect.predictions"},
+        ],
+    }
+
+
 def make_vlm_only_workflow() -> dict:
     """Single-step workflow: VLM block emits a `classes` list.
     Used as a standalone engine that the v2 auto-annotate handler runs FIRST,
@@ -333,8 +389,9 @@ _ENGINE_CACHE: dict[tuple[str, str], ExecutionEngine] = {}
 _WORKFLOW_FACTORIES = {
     "speed": make_speed_workflow,
     "smart": make_smart_workflow,
-    "autoannotate": lambda _backend: make_autoannotate_workflow(),  # backend-agnostic
-    "vlm": lambda _backend: make_vlm_only_workflow(),                 # backend-agnostic
+    "autoannotate": lambda _backend: make_autoannotate_workflow(),       # backend-agnostic
+    "vlm": lambda _backend: make_vlm_only_workflow(),                     # backend-agnostic
+    "sam3_autoannotate": lambda _backend: make_sam3_autoannotate_workflow(),
 }
 
 
@@ -373,6 +430,14 @@ def init_autoannotate_engine() -> ExecutionEngine:
 
 def init_vlm_engine() -> ExecutionEngine:
     return _engine_for("vlm", "pytorch")
+
+
+def init_sam3_engine() -> ExecutionEngine:
+    if not SAM3_AVAILABLE:
+        raise RuntimeError(
+            "sam3 package not installed. uv pip install sam3==0.1.3"
+        )
+    return _engine_for("sam3_autoannotate", "pytorch")
 
 
 def run_vlm_prompt_suggest(
@@ -559,6 +624,35 @@ def run_autoannotate_batch(
             "prompts": list(prompts),
             "weights": weights,
             "device": device,
+            "conf": float(confidence),
+        })
+        for r in result:
+            all_results.append((_unwrap_image(r["annotated"]), r["detections"]))
+    return all_results
+
+
+def run_sam3_batch(
+    engine: ExecutionEngine,
+    images_rgb: list[np.ndarray],
+    prompts: list[str],
+    confidence: float = 0.35,
+    batch_size: int = 1,
+) -> list[tuple[np.ndarray, Any]]:
+    """SAM3 batched auto-annotation. SAM3 is heavy — default batch_size=1 to
+    keep GPU memory under control. Same shape as run_autoannotate_batch so
+    the Tab 8 handler can swap between detectors freely."""
+    if not images_rgb:
+        return []
+    all_results: list[tuple[np.ndarray, Any]] = []
+    for chunk_start in range(0, len(images_rgb), batch_size):
+        chunk = images_rgb[chunk_start:chunk_start + batch_size]
+        wrapped = [
+            wrap_frame(img, f"sam3-{chunk_start + i}", chunk_start + i, 1.0)
+            for i, img in enumerate(chunk)
+        ]
+        result = engine.run(runtime_parameters={
+            "image": wrapped,
+            "prompts": list(prompts),
             "conf": float(confidence),
         })
         for r in result:

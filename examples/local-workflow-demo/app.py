@@ -1010,15 +1010,15 @@ def render_autoannotate_v2_diagram() -> np.ndarray:
         "version": "1.0",
         "name": "auto-annotate-v2",
         "stages": [
-            {"name": "sample", "type": "object_detection",
+            {"name": "vlm", "type": "object_detection",
              "params": {"block": "local_models/vlm_prompt@v1",
                         "model": "google/gemini-3.1-flash-lite",
                         "from": "first uploaded image"}},
             {"name": "classes", "type": "speed_estimator",
              "params": {"output": "list[str]", "via": "$steps.vlm.classes"}},
             {"name": "detect", "type": "object_detection",
-             "params": {"block": "local_models/yolo_world@v1",
-                        "weights": "yolov8x-worldv2.pt",
+             "params": {"block": "local_models/sam3@v1",
+                        "weights": "HF facebook/sam3",
                         "prompts": "$steps.vlm.classes"}},
             {"name": "boxes",  "type": "annotate",
              "params": {"block": "bounding_box_visualization@v1"}},
@@ -1059,24 +1059,26 @@ def run_auto_annotate_v2(files, user_context, progress=gr.Progress()):
     if not classes:
         return [], None, "_Gemini returned no classes — try a different sample image or add context._"
 
-    # Step 2 — autoannotate workflow engine on the full set
-    progress(0.3, desc=f"detecting {len(classes)} classes on {len(images)} images")
-    detect_engine = rer.init_autoannotate_engine()
+    # Step 2 — SAM3 detection workflow engine on the full set
+    progress(0.3, desc=f"SAM3 detecting {len(classes)} classes on {len(images)} images")
+    try:
+        detect_engine = rer.init_sam3_engine()
+    except RuntimeError as e:
+        return [], None, f"_SAM3 not available: {e}_"
     items: list[tuple[str, np.ndarray, Any]] = []
-    bsz = 8
+    bsz = 1  # SAM3 is heavy; one image per engine.run for memory predictability
     n_total = len(images)
     t0 = time.perf_counter()
     for start in range(0, n_total, bsz):
         chunk_imgs = images[start:start + bsz]
         chunk_fnames = fnames[start:start + bsz]
         try:
-            batch = rer.run_autoannotate_batch(
+            batch = rer.run_sam3_batch(
                 detect_engine, chunk_imgs, prompts=classes,
-                confidence=0.10, weights="yolov8x-worldv2.pt",
-                device=DEVICE, batch_size=bsz,
+                confidence=0.35, batch_size=bsz,
             )
         except Exception as e:
-            return [], None, f"_detection engine error: {e}_"
+            return [], None, f"_SAM3 detection engine error: {e}_"
         for fn, (ann, dets) in zip(chunk_fnames, batch):
             items.append((fn, ann, dets))
         progress(0.3 + 0.6 * (start + len(chunk_imgs)) / n_total,
@@ -1570,10 +1572,9 @@ plus engine warmup; subsequent calls are batched-fast.
 **Pipeline (both calls go through `ExecutionEngine.run()` — no direct VLM/detector calls):**
 
 > 1. `local_models/vlm_prompt@v1` runs on the first uploaded image → emits `classes: list[str]`
-> 2. `local_models/yolo_world@v1 → bounding_box_visualization@v1 → label_visualization@v1` runs on **all** uploaded images with those `classes` as prompts.
+> 2. `local_models/sam3@v1 → bounding_box_visualization@v1 → label_visualization@v1` runs SAM3 on **all** uploaded images with those `classes` as text prompts. SAM3 weights download from HuggingFace `facebook/sam3` on first use (~1.5 GB). Fully self-hosted — no Roboflow API.
 
-**Status:** {"`OPENROUTER_API_KEY` detected — Gemini available." if _vlm_ready else
-"⚠ `OPENROUTER_API_KEY` not set. Copy `.env.example` → `.env` to enable."}
+**Status:** {("`OPENROUTER_API_KEY` detected — Gemini available." if _vlm_ready else "⚠ `OPENROUTER_API_KEY` not set. Copy `.env.example` → `.env` to enable.") + (" · SAM3 available." if rer.SAM3_AVAILABLE else " · ⚠ SAM3 not installed (`uv pip install sam3==0.1.3`).")}
 """)
             with gr.Row():
                 with gr.Column(scale=1):
