@@ -1,0 +1,57 @@
+{
+  "workflows": [
+    {
+      "id": "speed",
+      "name": "Speed Estimation",
+      "description": "Local YOLO → ByteTracker → Velocity → BBox/Label viz. Estimates per-track speed in m/s from pixels_per_meter.",
+      "factory": "make_speed_workflow",
+      "factory_kwargs": {"backend": "pytorch"},
+      "default_runtime_params": {"conf": 0.30, "pixels_per_meter": 12.5, "weights": "yolov8n.pt", "device": "cuda"}
+    },
+    {
+      "id": "smart",
+      "name": "Smart Camera (Time-in-Zone)",
+      "description": "Local YOLO → ByteTracker → TimeInZone → Zone+BBox+Label viz. Tracks dwell time inside a polygon zone.",
+      "factory": "make_smart_workflow",
+      "factory_kwargs": {"backend": "pytorch"},
+      "default_runtime_params": {
+        "conf": 0.30,
+        "weights": "yolov8n.pt",
+        "device": "cuda",
+        "keep_classes": ["person", "car", "bicycle", "motorbike", "bus", "truck"],
+        "zone": [[100, 100], [540, 100], [540, 260], [100, 260]]
+      }
+    },
+    {
+      "id": "autoannotate",
+      "name": "Auto-Annotate (YOLO-World)",
+      "description": "Open-vocabulary detection from text prompts using YOLO-World + BBox/Label viz. No tracking.",
+      "factory": "make_autoannotate_workflow",
+      "factory_kwargs": {},
+      "default_runtime_params": {"prompts": ["person", "car", "dog"], "weights": "yolov8x-worldv2.pt", "device": "cuda", "conf": 0.15}
+    },
+    {
+      "id": "sam3_autoannotate",
+      "name": "Auto-Annotate (SAM3)",
+      "description": "Same shape as YOLO-World autoannotate but uses Meta SAM3 for segmentation-grade bboxes. Requires `sam3` package.",
+      "factory": "make_sam3_autoannotate_workflow",
+      "factory_kwargs": {},
+      "default_runtime_params": {"prompts": ["person", "car"], "conf": 0.35},
+      "requires": "sam3"
+    },
+    {
+      "id": "vlm_only",
+      "name": "VLM Class Suggester",
+      "description": "Single OpenAI-compatible block. Sends a sample image to gemini-flash-lite, asks for a class list as JSON.",
+      "factory": "make_vlm_only_workflow",
+      "factory_kwargs": {},
+      "default_runtime_params": {
+        "context": "",
+        "model": "google/gemini-3.1-flash-lite",
+        "api_key": "$env:OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1"
+      },
+      "requires_env": ["OPENROUTER_API_KEY"]
+    }
+  ]
+}

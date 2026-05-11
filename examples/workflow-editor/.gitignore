@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Node / Vite
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Secrets
+.env
+
+# User-saved workflows (the directory itself is tracked via .gitkeep)
+saved_workflows/*.json
+
+# uv lockfile is intentionally tracked (delete this line if you'd rather not)
+# uv.lock
+
+# OS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
