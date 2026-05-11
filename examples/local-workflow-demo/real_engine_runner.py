@@ -35,7 +35,7 @@ def _triton_available() -> bool:
 
 
 TRITON_AVAILABLE = _triton_available()
-_PLUGINS = ["local_yolo_plugin", "yolo_world_plugin"]
+_PLUGINS = ["local_yolo_plugin", "yolo_world_plugin", "vlm_prompt_plugin"]
 if TRITON_AVAILABLE:
     _PLUGINS.append("optimize.triton.triton_yolo_plugin")
 os.environ.setdefault("WORKFLOWS_PLUGINS", ",".join(_PLUGINS))
@@ -268,10 +268,40 @@ def make_autoannotate_workflow() -> dict:
     }
 
 
+def make_vlm_only_workflow() -> dict:
+    """Single-step workflow: VLM block emits a `classes` list.
+    Used as a standalone engine that the v2 auto-annotate handler runs FIRST,
+    on 1-2 sample images, to get the class list for the detector run.
+    Two engine.run() calls instead of one workflow, but both are real engine
+    work — no Python orchestration of inference."""
+    return {
+        "version": "1.0",
+        "inputs": [
+            {"type": "WorkflowImage", "name": "image"},
+            {"type": "WorkflowParameter", "name": "context", "default_value": ""},
+            {"type": "WorkflowParameter", "name": "model",
+             "default_value": "google/gemini-3.1-flash-lite"},
+        ],
+        "steps": [
+            {
+                "type": "local_models/vlm_prompt@v1",
+                "name": "vlm",
+                "images": "$inputs.image",
+                "context": "$inputs.context",
+                "model": "$inputs.model",
+            },
+        ],
+        "outputs": [
+            {"type": "JsonField", "name": "classes", "selector": "$steps.vlm.classes"},
+        ],
+    }
+
+
 # Backwards compatibility: existing call sites that import the static specs.
 REAL_SPEED_WORKFLOW: dict = make_speed_workflow("pytorch")
 SMART_CAMERA_WORKFLOW: dict = make_smart_workflow("pytorch")
 AUTOANNOTATE_WORKFLOW: dict = make_autoannotate_workflow()
+VLM_PROMPT_WORKFLOW: dict = make_vlm_only_workflow()
 
 
 def _build_model_manager() -> ModelManager:
@@ -304,6 +334,7 @@ _WORKFLOW_FACTORIES = {
     "speed": make_speed_workflow,
     "smart": make_smart_workflow,
     "autoannotate": lambda _backend: make_autoannotate_workflow(),  # backend-agnostic
+    "vlm": lambda _backend: make_vlm_only_workflow(),                 # backend-agnostic
 }
 
 
@@ -338,6 +369,35 @@ def init_smart_engine(backend: str = "pytorch") -> ExecutionEngine:
 
 def init_autoannotate_engine() -> ExecutionEngine:
     return _engine_for("autoannotate", "pytorch")
+
+
+def init_vlm_engine() -> ExecutionEngine:
+    return _engine_for("vlm", "pytorch")
+
+
+def run_vlm_prompt_suggest(
+    engine: ExecutionEngine,
+    sample_images_rgb: list[np.ndarray],
+    user_context: str = "",
+    model: str = "google/gemini-3.1-flash-lite",
+) -> list[str]:
+    """Call the VLM workflow engine on 1-2 sample images, return suggested classes.
+    All inference happens via engine.run() — no direct VLM calls from the handler."""
+    if not sample_images_rgb:
+        return []
+    wrapped = [
+        wrap_frame(img, f"vlm-sample-{i}", i + 1, 1.0)
+        for i, img in enumerate(sample_images_rgb)
+    ]
+    result = engine.run(runtime_parameters={
+        "image": wrapped,
+        "context": user_context or "",
+        "model": model,
+    })
+    # The VLM block emits the same `classes` for each batch element; take element 0.
+    if not result:
+        return []
+    return list(result[0].get("classes", []) or [])
 
 
 def reset_engine_cache() -> None:
