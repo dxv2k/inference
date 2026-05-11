@@ -18,3 +18,7 @@ optimize/triton/model_repository/*/1/*.plan
 __pycache__/
 *.pyc
 .venv/
+
+# Secrets — never commit OpenRouter / Anthropic / Gemini keys
+.env
+*.env.local

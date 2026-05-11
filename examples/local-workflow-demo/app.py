@@ -22,6 +22,7 @@ from ultralytics import YOLO
 
 import workflow as wf
 import real_engine_runner as rer
+import vlm_prompt_generator as vlm
 
 FONT_DIR = "/usr/share/fonts/truetype/dejavu"
 def _font(name: str, size: int):
@@ -1004,6 +1005,41 @@ _Pipeline: `local_models/yolo_world@v1` → `bounding_box_visualization@v1` → 
     return gallery, summary, coco_json, zip_path, render_autoannotate_diagram(), spec_json
 
 
+def generate_prompts_with_gemini(files, user_context, n_samples):
+    """Tab 8 — call Gemini on the first n_samples uploaded images and return a
+    comma-separated prompt string + a status markdown."""
+    if not files:
+        return "", "_upload at least one image before asking Gemini to suggest classes_"
+    if not vlm.is_configured():
+        return "", ("_OpenRouter not configured. Copy `.env.example` → `.env` "
+                    "and put your `OPENROUTER_API_KEY` in._")
+    inputs = _read_images_from_files(files)
+    if not inputs:
+        return "", "_no decodable images among the uploaded files_"
+    sample = [im for _, im in inputs[:int(n_samples)]]
+    try:
+        classes, debug = vlm.generate_class_prompts(
+            sample_images=sample,
+            user_context=user_context or "",
+            max_samples=int(n_samples),
+        )
+    except RuntimeError as e:
+        return "", f"_Gemini call failed: {e}_"
+
+    prompts_text = ", ".join(classes)
+    usage = debug.get("usage", {})
+    status = f"""**Gemini suggested {len(classes)} classes** from {debug['n_sample_images']} sample image(s).
+
+- **Model:** `{debug['model']}`
+- **Latency:** {debug['latency_ms']} ms
+- **Tokens:** {usage.get('total_tokens', 0)} (prompt {usage.get('prompt_tokens', 0)}, completion {usage.get('completion_tokens', 0)})
+- **Cost:** ${usage.get('cost', 0):.6f}
+
+Suggested classes have been written into the prompts textbox below. Edit them if you want, then click **Annotate batch**.
+"""
+    return prompts_text, status
+
+
 theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="cyan")
 
 with gr.Blocks(title=DEMO_TITLE) as demo:
@@ -1022,6 +1058,7 @@ Swap the spec — get a completely different AI capability. All self-hosted on t
 | **5** | **REAL Roboflow `ExecutionEngine`** | LocalYOLO + ByteTrack + TimeInZone | Smart camera — backend swappable: **PyTorch** or **Triton** |
 | **6** | **REAL Roboflow `ExecutionEngine`** | RTSP → Tab-4 / Tab-5 workflow → webhook callback | Production pattern: RTSP URL + your alert API URL, backend swappable |
 | **7** | **REAL Roboflow `ExecutionEngine`** | YOLO-World (open-vocab) | Auto-annotation: type any class names, get bboxes + COCO/YOLO export |
+| **8** | **REAL Roboflow `ExecutionEngine`** | Gemini → YOLO-World | VLM picks the classes from sample images, then runs YOLO-World v2 |
 
 _Triton backend appears as an option only when `tritonclient` is installed AND the `optimize.triton.triton_yolo_plugin` is loaded. See `BACKENDS.md` and `optimize/triton/README.md`._
 """)
@@ -1458,11 +1495,122 @@ plus engine warmup; subsequent calls are batched-fast.
                 outputs=[aa_gallery, aa_summary, aa_coco, aa_zip, aa_diagram, aa_spec],
             )
 
+        with gr.TabItem("8 · Auto-annotate v2 (Gemini → YOLO-World)", id=7):
+            _vlm_ready = vlm.is_configured()
+            gr.Markdown(f"""### Use-case: VLM-suggested prompts → open-vocab detector → YOLO export
+**Same flow as Tab 7, but you don't have to know your class list ahead of time.**
+Drop in a batch of images, let Gemini look at 1-2 samples and suggest the class
+list, then run YOLO-World v2 across all images with those prompts. Output is
+identical to Tab 7 (gallery + COCO + YOLO zip).
+
+**Self-hosted:** the only network call is to OpenRouter (Gemini). The detector
+is `local_models/yolo_world@v1` — Ultralytics YOLO-World v2 weights from
+GitHub, running fully on this box. No Roboflow API used.
+
+**Status:** {"`OPENROUTER_API_KEY` detected — Gemini is available." if _vlm_ready else
+"⚠ `OPENROUTER_API_KEY` not set. Copy `.env.example` → `.env` to enable."}
+""")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    aa2_files_in = gr.File(
+                        label="Images to annotate (drag-drop many)",
+                        file_count="multiple",
+                        file_types=["image"],
+                        height=180,
+                    )
+                    aa2_context = gr.Textbox(
+                        label="Optional context for Gemini",
+                        placeholder="e.g. warehouse PPE compliance; we want forklifts, hard hats, "
+                                    "safety vests, people not wearing safety equipment",
+                        lines=2,
+                    )
+                    with gr.Row():
+                        aa2_n_samples = gr.Slider(1, 3, value=2, step=1,
+                                                  label="Sample images sent to Gemini",
+                                                  info="More samples = better suggestions, but slower & costlier.")
+                        aa2_gen_btn = gr.Button(
+                            "Suggest classes (Gemini)", variant="secondary",
+                            interactive=_vlm_ready,
+                        )
+                    aa2_status = gr.Markdown(value="_run Gemini to populate the prompts below, or type them yourself_")
+                    aa2_prompts = gr.Textbox(
+                        value="",
+                        label="Class prompts (comma-separated)",
+                        info="Edit freely. The detector uses whatever is in this box.",
+                    )
+                    with gr.Row():
+                        aa2_conf = gr.Slider(0.01, 0.9, value=0.10, step=0.01,
+                                             label="Confidence threshold")
+                        aa2_batch = gr.Slider(1, 16, value=8, step=1,
+                                              label="Batch size")
+                    aa2_weights = gr.Dropdown(
+                        choices=[
+                            "yolov8x-worldv2.pt",
+                            "yolov8l-worldv2.pt",
+                            "yolov8m-worldv2.pt",
+                            "yolov8s-worldv2.pt",
+                            "yolov8x-world.pt",
+                            "yolov8s-world.pt",
+                        ],
+                        value="yolov8x-worldv2.pt",
+                        label="YOLO-World checkpoint",
+                    )
+                    aa2_run_btn = gr.Button("Annotate batch", variant="primary", size="lg")
+                with gr.Column(scale=2):
+                    aa2_gallery = gr.Gallery(
+                        label="Annotated previews",
+                        columns=4, rows=2, height=480,
+                        show_label=True, object_fit="contain",
+                    )
+                    aa2_summary = gr.Markdown()
+            with gr.Tabs():
+                with gr.TabItem("YOLO labels (download zip)"):
+                    gr.Markdown(
+                        "`labels/<stem>.txt` (one per image, normalized "
+                        "`class_id cx cy w h`), `classes.txt`, plus `annotated/<stem>.jpg` previews."
+                    )
+                    aa2_zip = gr.File(label="autoannotate-v2.zip", height=80)
+                with gr.TabItem("COCO JSON (all images)"):
+                    aa2_coco = gr.Code(language="json", label="coco.json", lines=18)
+                with gr.TabItem("Workflow JSON spec"):
+                    aa2_spec = gr.Code(language="json", label="autoannotate.json", lines=20,
+                                       value=json.dumps(rer.AUTOANNOTATE_WORKFLOW, indent=2))
+            gr.Markdown("### Pipeline")
+            gr.Markdown("""
+```
+sample 1-2 images  →  Gemini (OpenRouter)  →  class list
+                                                  │
+N images  ───────────────────────────────────────►│
+                                                  ▼
+                          local_models/yolo_world@v1 (batch=N)
+                                                  │
+                                                  ▼
+                bounding_box_visualization@v1 → label_visualization@v1
+                                                  │
+                                                  ▼
+                       gallery + COCO JSON + YOLO labels zip
+```
+""")
+            aa2_diagram = gr.Image(label="Stages", show_label=False, height=180,
+                                   value=render_autoannotate_diagram())
+
+            aa2_gen_btn.click(
+                generate_prompts_with_gemini,
+                inputs=[aa2_files_in, aa2_context, aa2_n_samples],
+                outputs=[aa2_prompts, aa2_status],
+            )
+            aa2_run_btn.click(
+                run_autoannotate,
+                inputs=[aa2_files_in, aa2_prompts, aa2_conf, aa2_weights, aa2_batch],
+                outputs=[aa2_gallery, aa2_summary, aa2_coco, aa2_zip, aa2_diagram, aa2_spec],
+            )
+
     gr.Markdown("---")
     gr.Markdown(f"_{DEVICE.upper()} · "
                 f"Tabs 1-3 use our hand-rolled engine (`workflow.py`); "
                 f"Tabs 4-6 use the **real** Roboflow `ExecutionEngine` driven by `local_yolo_plugin` (PyTorch or Triton). "
-                f"Tab 7 uses `yolo_world_plugin` for open-vocabulary auto-annotation. "
+                f"Tabs 7-8 use `yolo_world_plugin` for open-vocabulary auto-annotation. "
+                f"Tab 8 adds VLM-suggested class prompts via OpenRouter (the only non-local hop). "
                 f"No Roboflow API key required._")
 
 
