@@ -1230,6 +1230,9 @@ def stream_sam3_realtime(rtsp_url, user_context, alert_url, conf, frame_skip, al
     last_detection_count = 0
     last_latency_s = 0.0
     stream_t0 = time.time()
+    # Engine-call counters (visible in perf_view so the user can SEE the invariant)
+    vlm_calls = 1  # Step A above already fired the one VLM call
+    sam3_calls = 0
     # The first frame we already decoded is fair game.
     pending_first = first_rgb
 
@@ -1246,6 +1249,7 @@ def stream_sam3_realtime(rtsp_url, user_context, alert_url, conf, frame_skip, al
                     cap.release()
                     perf_md = _sam3_perf_md(prompts, latencies, frames_processed,
                                             stream_t0, last_latency_s, last_detection_count,
+                                            vlm_calls=vlm_calls, sam3_calls=sam3_calls,
                                             note="RTSP stream lost (30 consecutive read failures)")
                     yield None, prompts_md, perf_md, _alerts_md(alerts_log)
                     return
@@ -1268,10 +1272,12 @@ def stream_sam3_realtime(rtsp_url, user_context, alert_url, conf, frame_skip, al
                 sam3_engine, [rgb], prompts=prompts,
                 confidence=float(conf), batch_size=1,
             )
+            sam3_calls += 1
         except Exception as e:
             cap.release()
             perf_md = _sam3_perf_md(prompts, latencies, frames_processed,
                                     stream_t0, last_latency_s, last_detection_count,
+                                    vlm_calls=vlm_calls, sam3_calls=sam3_calls,
                                     note=f"SAM3 engine error: {e}")
             yield None, prompts_md, perf_md, _alerts_md(alerts_log)
             return
@@ -1321,12 +1327,15 @@ def stream_sam3_realtime(rtsp_url, user_context, alert_url, conf, frame_skip, al
             alerts_log = alerts_log[-15:]
 
         perf_md = _sam3_perf_md(prompts, latencies, frames_processed,
-                                stream_t0, last_latency_s, last_detection_count)
+                                stream_t0, last_latency_s, last_detection_count,
+                                vlm_calls=vlm_calls, sam3_calls=sam3_calls)
         yield annotated, prompts_md, perf_md, _alerts_md(alerts_log)
 
 
 def _sam3_perf_md(prompts, latencies, frames_processed, stream_t0,
-                  last_latency_s, last_detection_count, note: str | None = None) -> str:
+                  last_latency_s, last_detection_count,
+                  vlm_calls: int = 0, sam3_calls: int = 0,
+                  note: str | None = None) -> str:
     elapsed = max(time.time() - stream_t0, 1e-6)
     lats = list(latencies)
     mean_s = (sum(lats) / len(lats)) if lats else 0.0
@@ -1336,6 +1345,8 @@ def _sam3_perf_md(prompts, latencies, frames_processed, stream_t0,
     note_md = f"\n\n_{note}_" if note else ""
     return (
         f"### Performance (live)\n"
+        f"**Engine calls this run:**  VLM **{vlm_calls}**  ·  SAM3 **{sam3_calls}**  "
+        f"_(VLM should stay at 1; SAM3 grows with frames processed.)_\n"
         f"**Frames processed:** {frames_processed}  ·  **Time elapsed:** {elapsed:.1f} s  ·  "
         f"**Effective fps:** {eff_fps:.2f}\n"
         f"**Latency (per frame):** mean {mean_s:.1f} s · p50 {p50_s:.1f} s · p95 {p95_s:.1f} s\n"
