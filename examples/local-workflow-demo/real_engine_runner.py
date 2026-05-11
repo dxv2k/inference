@@ -229,7 +229,7 @@ def make_autoannotate_workflow() -> dict:
             {"type": "WorkflowParameter", "name": "prompts",
              "default_value": ["person", "car", "dog"]},
             {"type": "WorkflowParameter", "name": "weights",
-             "default_value": "yolov8s-world.pt"},
+             "default_value": "yolov8x-worldv2.pt"},
             {"type": "WorkflowParameter", "name": "device", "default_value": "cuda"},
             {"type": "WorkflowParameter", "name": "conf", "default_value": 0.15},
         ],
@@ -453,7 +453,7 @@ def run_autoannotate_on_image(
     image_rgb: np.ndarray,
     prompts: list[str],
     confidence: float = 0.15,
-    weights: str = "yolov8s-world.pt",
+    weights: str = "yolov8x-worldv2.pt",
     device: str = "cuda",
 ) -> tuple[np.ndarray, Any, int]:
     """Single-image auto-annotation. No video metadata needed — the workflow
@@ -477,7 +477,7 @@ def run_autoannotate_batch(
     images_rgb: list[np.ndarray],
     prompts: list[str],
     confidence: float = 0.15,
-    weights: str = "yolov8s-world.pt",
+    weights: str = "yolov8x-worldv2.pt",
     device: str = "cuda",
     batch_size: int = 8,
 ) -> list[tuple[np.ndarray, Any]]:

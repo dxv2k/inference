@@ -1383,7 +1383,10 @@ YOLO forward pass.
 | Auto-annotate | `local_models/yolo_world@v1` → `bounding_box_visualization@v1` → `label_visualization@v1` |
 
 **Tip:** YOLO-World scores run lower than COCO YOLO. Start with conf=0.10–0.15.
-**Throughput on this box:** ~30 images/sec at batch=8 with `yolov8s-world.pt`. Larger checkpoints are slower.
+**Default model:** `yolov8x-worldv2.pt` — the heaviest v2 weights (~140 MB, downloaded on first use). Better recall
+on novel / unusual classes than the v1 series. Measured throughput on this box at batch=8:
+`yolov8x-worldv2 ~37 img/s` (3090-class GPU). First call pays the download tax (~5 sec at typical GitHub bandwidth)
+plus engine warmup; subsequent calls are batched-fast.
 """)
             with gr.Row():
                 with gr.Column(scale=1):
@@ -1406,14 +1409,19 @@ YOLO forward pass.
                                              info="Images per engine.run() call. Bigger = fewer Python boundary crossings, more GPU memory.")
                     aa_weights = gr.Dropdown(
                         choices=[
-                            "yolov8s-world.pt",
-                            "yolov8m-world.pt",
+                            "yolov8x-worldv2.pt",     # v2 family — better recall on novel classes
+                            "yolov8l-worldv2.pt",
+                            "yolov8m-worldv2.pt",
+                            "yolov8s-worldv2.pt",
+                            "yolov8x-world.pt",       # v1 family — slightly older, faster downloads
                             "yolov8l-world.pt",
-                            "yolov8x-world.pt",
+                            "yolov8m-world.pt",
+                            "yolov8s-world.pt",
                         ],
-                        value="yolov8s-world.pt",
+                        value="yolov8x-worldv2.pt",
                         label="YOLO-World checkpoint",
-                        info="Larger = more accurate, slower; downloaded on first use.",
+                        info="v2 family > v1 for novel classes. Larger letter (x>l>m>s) = more accurate, slower. "
+                             "First-time download for yolov8x-worldv2 is ~140 MB.",
                     )
                     aa_btn = gr.Button("Auto-annotate batch", variant="primary", size="lg")
                 with gr.Column(scale=2):

@@ -99,9 +99,10 @@ class YoloWorldManifest(WorkflowBlockManifest):
     type: Literal["local_models/yolo_world@v1"]
     images: WorkflowImageSelector = Field(description="Input image(s). Batch-aware.")
     weights: Union[str, Selector()] = Field(
-        default="yolov8s-world.pt",
-        description="YOLO-World checkpoint. Options: yolov8s-world.pt / yolov8m-world.pt / "
-                    "yolov8l-world.pt / yolov8x-world.pt (slower & more accurate as size grows).",
+        default="yolov8x-worldv2.pt",
+        description="YOLO-World checkpoint. v2 family (yolov8s/m/l/x-worldv2.pt) is the better-recall "
+                    "successor; the v1 family (yolov8s/m/l/x-world.pt) is also accepted. Larger letter "
+                    "(x > l > m > s) = more accurate but slower. First download for yolov8x-worldv2 is ~140 MB.",
     )
     device: Union[str, Selector()] = Field(
         default="cuda",
