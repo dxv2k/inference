@@ -22,7 +22,6 @@ from ultralytics import YOLO
 
 import workflow as wf
 import real_engine_runner as rer
-import vlm_prompt_generator as vlm
 
 FONT_DIR = "/usr/share/fonts/truetype/dejavu"
 def _font(name: str, size: int):
@@ -1011,11 +1010,11 @@ def render_autoannotate_v2_diagram() -> np.ndarray:
         "name": "auto-annotate-v2",
         "stages": [
             {"name": "vlm", "type": "object_detection",
-             "params": {"block": "local_models/vlm_prompt@v1",
+             "params": {"block": "roboflow_core/openai_compatible@v1",
                         "model": "google/gemini-3.1-flash-lite",
                         "from": "first uploaded image"}},
             {"name": "classes", "type": "speed_estimator",
-             "params": {"output": "list[str]", "via": "$steps.vlm.classes"}},
+             "params": {"output": "list[str]", "via": "$steps.vlm.output (text)"}},
             {"name": "detect", "type": "object_detection",
              "params": {"block": "local_models/sam3@v1",
                         "weights": "HF facebook/sam3",
@@ -1036,7 +1035,7 @@ def run_auto_annotate_v2(files, user_context, progress=gr.Progress()):
     No direct VLM/detector calls outside the workflow engine."""
     if not files:
         return [], None, "_upload at least one image_"
-    if not vlm.is_configured():
+    if not rer.vlm_is_configured():
         return [], None, ("_OpenRouter not configured. Copy `.env.example` → `.env` "
                           "and set `OPENROUTER_API_KEY`._")
 
@@ -1100,7 +1099,7 @@ def run_auto_annotate_v2(files, user_context, progress=gr.Progress()):
 **Total detections:** {total_dets}
 
 Both steps ran through the Roboflow `ExecutionEngine`:
-1. `local_models/vlm_prompt@v1` — VLM workflow, sampled the first image
+1. `roboflow_core/openai_compatible@v1` — VLM workflow, sampled the first image
 2. `local_models/yolo_world@v1` → `bounding_box_visualization@v1` → `label_visualization@v1` — annotation workflow on all {n_total} images
 """
     progress(1.0, desc="done")
@@ -1563,7 +1562,7 @@ plus engine warmup; subsequent calls are batched-fast.
             )
 
         with gr.TabItem("8 · Auto-annotate v2 (Gemini → YOLO-World)", id=7):
-            _vlm_ready = vlm.is_configured()
+            _vlm_ready = rer.vlm_is_configured()
             gr.Markdown(f"""### Auto-annotate v2 — VLM picks the classes
 
 **Input:** a batch of images + (optional) one-line description of what to detect.
@@ -1571,7 +1570,7 @@ plus engine warmup; subsequent calls are batched-fast.
 
 **Pipeline (both calls go through `ExecutionEngine.run()` — no direct VLM/detector calls):**
 
-> 1. `local_models/vlm_prompt@v1` runs on the first uploaded image → emits `classes: list[str]`
+> 1. `roboflow_core/openai_compatible@v1` runs on the first uploaded image → emits `classes: list[str]`
 > 2. `local_models/sam3@v1 → bounding_box_visualization@v1 → label_visualization@v1` runs SAM3 on **all** uploaded images with those `classes` as text prompts. SAM3 weights download from HuggingFace `facebook/sam3` on first use (~1.5 GB). Fully self-hosted — no Roboflow API.
 
 **Status:** {("`OPENROUTER_API_KEY` detected — Gemini available." if _vlm_ready else "⚠ `OPENROUTER_API_KEY` not set. Copy `.env.example` → `.env` to enable.") + (" · SAM3 available." if rer.SAM3_AVAILABLE else " · ⚠ SAM3 not installed (`uv pip install sam3==0.1.3`).")}

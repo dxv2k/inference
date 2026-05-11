@@ -8,7 +8,9 @@ Pipeline:
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +19,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+# Load .env if present so OPENROUTER_API_KEY is available without exporting
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+except ImportError:
+    pass
 
 # Make plugins discoverable and configure WORKFLOWS_PLUGINS BEFORE importing
 # inference. The Triton plugin is included only if tritonclient is importable;
@@ -44,7 +53,7 @@ def _sam3_available() -> bool:
 
 TRITON_AVAILABLE = _triton_available()
 SAM3_AVAILABLE = _sam3_available()
-_PLUGINS = ["local_yolo_plugin", "yolo_world_plugin", "vlm_prompt_plugin"]
+_PLUGINS = ["local_yolo_plugin", "yolo_world_plugin"]
 if SAM3_AVAILABLE:
     _PLUGINS.append("sam3_plugin")
 if TRITON_AVAILABLE:
@@ -324,12 +333,29 @@ def make_sam3_autoannotate_workflow() -> dict:
     }
 
 
+_VLM_SYSTEM_PROMPT = """You are an expert vision-data annotator. Look at the
+sample image and propose a concise list of class names that should be
+auto-annotated across a larger dataset of similar images.
+
+Rules:
+- Reply with ONLY a JSON array of strings. No prose, no markdown fences, no
+  trailing commas. Example: ["person", "car", "traffic light"]
+- Use short, lowercase class names suitable for an object detector.
+- Prefer specific concrete classes (e.g. "forklift" not "vehicle"; "hard
+  hat" not "ppe"). 5-15 classes is a good range; more is OK if the scene
+  warrants it.
+- If extra user context is given, weight class choices toward that context.
+- JUST the JSON array — nothing else."""
+
+
 def make_vlm_only_workflow() -> dict:
-    """Single-step workflow: VLM block emits a `classes` list.
-    Used as a standalone engine that the v2 auto-annotate handler runs FIRST,
-    on 1-2 sample images, to get the class list for the detector run.
-    Two engine.run() calls instead of one workflow, but both are real engine
-    work — no Python orchestration of inference."""
+    """Single-step workflow: VLM emits a class list as plain text.
+
+    Uses the upstream `roboflow_core/openai_compatible@v1` block — no custom
+    plugin. The block produces a STRING output; the caller parses the JSON
+    array out of it (gemini-flash-lite reliably returns clean JSON given
+    the system prompt, but we have a tolerant parser regardless).
+    """
     return {
         "version": "1.0",
         "inputs": [
@@ -337,18 +363,35 @@ def make_vlm_only_workflow() -> dict:
             {"type": "WorkflowParameter", "name": "context", "default_value": ""},
             {"type": "WorkflowParameter", "name": "model",
              "default_value": "google/gemini-3.1-flash-lite"},
+            {"type": "WorkflowParameter", "name": "api_key", "default_value": ""},
+            {"type": "WorkflowParameter", "name": "base_url",
+             "default_value": "https://openrouter.ai/api/v1"},
         ],
         "steps": [
             {
-                "type": "local_models/vlm_prompt@v1",
+                "type": "roboflow_core/openai_compatible@v1",
                 "name": "vlm",
-                "images": "$inputs.image",
-                "context": "$inputs.context",
-                "model": "$inputs.model",
+                "base_url": "$inputs.base_url",
+                "model_name": "$inputs.model",
+                "api_key": "$inputs.api_key",
+                "system_prompt": _VLM_SYSTEM_PROMPT,
+                "prompt": (
+                    "Context (may be empty): {{ $parameters.context }}\n\n"
+                    "Examine this image and propose the class list. "
+                    "Respond with ONLY a JSON array of class names.\n"
+                    "{{ $parameters.image }}"
+                ),
+                "prompt_parameters": {
+                    "image": "$inputs.image",
+                    "context": "$inputs.context",
+                },
+                "max_tokens": 400,
+                "temperature": 0.2,
             },
         ],
         "outputs": [
-            {"type": "JsonField", "name": "classes", "selector": "$steps.vlm.classes"},
+            {"type": "JsonField", "name": "raw_text", "selector": "$steps.vlm.output"},
+            {"type": "JsonField", "name": "error", "selector": "$steps.vlm.error_status"},
         ],
     }
 
@@ -440,29 +483,75 @@ def init_sam3_engine() -> ExecutionEngine:
     return _engine_for("sam3_autoannotate", "pytorch")
 
 
+_JSON_ARRAY_RE = re.compile(r"\[[^\[\]]*\]", re.DOTALL)
+
+
+def _parse_class_list(text: str) -> list[str]:
+    """Tolerant parser for VLM responses. gemini-flash-lite usually returns a
+    clean JSON array but occasionally wraps it in ```json fences or trailing
+    commentary."""
+    if not text:
+        return []
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+    except json.JSONDecodeError:
+        pass
+    m = _JSON_ARRAY_RE.search(text)
+    if m:
+        try:
+            parsed = json.loads(m.group(0))
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except json.JSONDecodeError:
+            pass
+    cleaned = text.strip("[]").replace('"', "").replace("'", "")
+    return [c.strip() for c in cleaned.split(",") if c.strip()]
+
+
+def vlm_is_configured() -> bool:
+    """True iff the OpenRouter API key is set in env (loaded from .env if present)."""
+    return bool(os.environ.get("OPENROUTER_API_KEY"))
+
+
 def run_vlm_prompt_suggest(
     engine: ExecutionEngine,
     sample_images_rgb: list[np.ndarray],
     user_context: str = "",
     model: str = "google/gemini-3.1-flash-lite",
 ) -> list[str]:
-    """Call the VLM workflow engine on 1-2 sample images, return suggested classes.
-    All inference happens via engine.run() — no direct VLM calls from the handler."""
+    """Call the VLM workflow engine on 1 sample image, return suggested classes.
+    All inference happens via engine.run() — the upstream
+    `roboflow_core/openai_compatible@v1` block makes the OpenRouter call.
+    """
     if not sample_images_rgb:
         return []
-    wrapped = [
-        wrap_frame(img, f"vlm-sample-{i}", i + 1, 1.0)
-        for i, img in enumerate(sample_images_rgb)
-    ]
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY not set. Copy .env.example -> .env and put your key in."
+        )
+    # The upstream block isn't batch-aware; one image per call. Use the first sample.
+    wrapped = [wrap_frame(sample_images_rgb[0], "vlm-sample-0", 1, 1.0)]
     result = engine.run(runtime_parameters={
         "image": wrapped,
         "context": user_context or "",
         "model": model,
+        "api_key": api_key,
+        "base_url": os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
     })
-    # The VLM block emits the same `classes` for each batch element; take element 0.
     if not result:
         return []
-    return list(result[0].get("classes", []) or [])
+    raw_text = result[0].get("raw_text") or ""
+    err = result[0].get("error")
+    if err:
+        raise RuntimeError(f"VLM block returned error: {err}")
+    return _parse_class_list(str(raw_text))
 
 
 def reset_engine_cache() -> None:
