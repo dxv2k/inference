@@ -69,13 +69,17 @@ from inference.core.workflows.prototypes.block import (
 
 CLASS_NAME_DATA_KEY = "class_name"
 
-# CLIP-style BPE vocabulary required by sam3's text encoder. Ships with the
-# inference repo's perception_encoder package, so we re-use it instead of
-# downloading a duplicate.
-_DEFAULT_BPE_PATH = (
+# CLIP-style BPE vocabulary required by sam3's text encoder. We ship a copy
+# next to this plugin file so the plugin is portable (e.g. mounted into a
+# container at /plugins). Falls back to the inference-repo copy if the local
+# one is missing (for repo-relative installs).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_BPE = os.path.join(_HERE, "bpe_simple_vocab_16e6.txt.gz")
+_REPO_BPE = (
     "/media/ubuntu_data/viAct/inference/inference/models/perception_encoder/"
     "vision_encoder/bpe_simple_vocab_16e6.txt.gz"
 )
+_DEFAULT_BPE_PATH = _LOCAL_BPE if os.path.exists(_LOCAL_BPE) else _REPO_BPE
 
 # Lazy global cache — SAM3 is ~1.5 GB on first download and ~600 MB once on
 # GPU, so we only ever want one instance.
